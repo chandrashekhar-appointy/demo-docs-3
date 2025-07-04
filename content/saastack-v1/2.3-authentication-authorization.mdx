@@ -1,0 +1,333 @@
+# Authentication & Authorization
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [go.sum](go.sum)
+- [rate-limiter.go](rate-limiter.go)
+- [redis/redis.go](redis/redis.go)
+- [router.go](router.go)
+- [service_token.go](service_token.go)
+
+</details>
+
+
+
+This document covers the multi-layered authentication and authorization system implemented in the waqt-deployment service. The system supports four distinct authentication mechanisms and implements role-based access control (RBAC) with hierarchical permissions.
+
+For detailed information about middleware configuration and routing, see [Routing & Middleware](#3.2). For role-based access control implementation details, see [Role-Based Access Control](#5.1).
+
+## Authentication Architecture Overview
+
+The authentication system is built as a middleware chain that processes requests through multiple authentication layers. Each layer can independently authenticate a request, with later layers taking precedence if multiple authentication methods are present.
+
+**Authentication Flow Architecture**
+
+```mermaid
+graph TB
+    subgraph "Request Processing"
+        REQ["Incoming Request"]
+        CORS["CORS Handler"]
+        RATE["Rate Limiter"]
+        AUTH_CHAIN["Authentication Chain"]
+        ENFORCE["Authentication Enforcement"]
+        HANDLER["Request Handler"]
+    end
+    
+    subgraph "Authentication Methods"
+        JWT["JWT Authentication<br/>auth.UserInfoFromJwtMiddleware"]
+        API_KEY["API Key Authentication<br/>APIKeyMiddleware"]
+        SERVICE_TOKEN["Service Token Authentication<br/>ServiceTokenMiddleware"]
+        EXTERNAL_JWT["External JWT Authentication<br/>NewExternalJWtMiddleware"]
+    end
+    
+    subgraph "User Context"
+        USER_INFO["UserInfo Creation<br/>userinfo.NewContext"]
+        USER_CTX["Request Context<br/>with UserInfo"]
+    end
+    
+    REQ --> CORS
+    CORS --> RATE
+    RATE --> AUTH_CHAIN
+    
+    AUTH_CHAIN --> JWT
+    AUTH_CHAIN --> API_KEY
+    AUTH_CHAIN --> SERVICE_TOKEN
+    AUTH_CHAIN --> EXTERNAL_JWT
+    
+    JWT --> USER_INFO
+    API_KEY --> USER_INFO
+    SERVICE_TOKEN --> USER_INFO
+    EXTERNAL_JWT --> USER_INFO
+    
+    USER_INFO --> USER_CTX
+    USER_CTX --> ENFORCE
+    ENFORCE --> HANDLER
+```
+
+Sources: [router.go:100-163](), [router.go:388-406]()
+
+## Authentication Methods
+
+The system implements four distinct authentication mechanisms, each handled by dedicated middleware components.
+
+### JWT Authentication
+
+Standard JWT token authentication using the `Authorization` header. Tokens are validated using the configured JWT settings and user information is extracted from the token claims.
+
+**JWT Processing Flow**
+
+```mermaid
+graph LR
+    subgraph "JWT Flow"
+        JWT_REQ["Request with<br/>Authorization: Bearer token"]
+        JWT_EXTRACT["auth.UserInfoFromJwtMiddleware"]
+        JWT_VALIDATE["Token Validation"]
+        JWT_USER["UserInfo Extraction"]
+        JWT_CTX["Context Update"]
+    end
+    
+    JWT_REQ --> JWT_EXTRACT
+    JWT_EXTRACT --> JWT_VALIDATE
+    JWT_VALIDATE --> JWT_USER
+    JWT_USER --> JWT_CTX
+```
+
+Sources: [router.go:136](), [router.go:400]()
+
+### API Key Authentication
+
+API key authentication using the `X-API-Key` header. Keys are validated against the API key service and associated user profiles are retrieved.
+
+```mermaid
+graph TD
+    subgraph "API Key Authentication"
+        API_REQ["Request with<br/>X-API-Key header"]
+        API_CHECK["APIKeyMiddleware<br/>line 565"]
+        API_VALIDATE["apiKeypb.ValidateApiKey"]
+        API_USER["userpb.GetUserProfile"]
+        API_CTX["userinfo.NewContext"]
+    end
+    
+    API_REQ --> API_CHECK
+    API_CHECK --> API_VALIDATE
+    API_VALIDATE --> API_USER
+    API_USER --> API_CTX
+```
+
+The `APIKeyMiddleware` function performs the following operations:
+
+| Step | Action | Error Handling |
+|------|--------|----------------|
+| 1 | Extract `X-API-Key` header | Continue if not present |
+| 2 | Validate API key via `apiKeypb.ValidateApiKey` | Return 401 if invalid |
+| 3 | Fetch user profile via `userpb.GetUserProfile` | Return 500 if fails |
+| 4 | Create `UserInfo` context | Continue to next middleware |
+
+Sources: [router.go:553-608](), [router.go:54]()
+
+### Service Token Authentication
+
+Service token authentication using the `X-Service-Token` header. Tokens are validated for active status and expiration, with usage tracking.
+
+```mermaid
+graph TD
+    subgraph "Service Token Flow"
+        SRV_REQ["Request with<br/>X-Service-Token header"]
+        SRV_CHECK["ServiceTokenMiddleware"]
+        SRV_GET["GetServiceTokenByTokenValue"]
+        SRV_ACTIVE{"IsActive?"}
+        SRV_EXPIRE{"Token Expired?"}
+        SRV_UPDATE["UpdateLastUsedOn"]
+        SRV_CTX["UserInfo Context<br/>with IsServiceToken=true"]
+    end
+    
+    SRV_REQ --> SRV_CHECK
+    SRV_CHECK --> SRV_GET
+    SRV_GET --> SRV_ACTIVE
+    SRV_ACTIVE -->|No| SRV_ERROR["412 Precondition Failed"]
+    SRV_ACTIVE -->|Yes| SRV_EXPIRE
+    SRV_EXPIRE -->|Yes| SRV_ERROR
+    SRV_EXPIRE -->|No| SRV_UPDATE
+    SRV_UPDATE --> SRV_CTX
+```
+
+Sources: [service_token.go:29-93](), [service_token.go:16]()
+
+### External JWT Authentication
+
+External JWT authentication for company-specific tokens using slug-based routing. Tokens are validated against external JWT configurations based on the company slug.
+
+```mermaid
+graph LR
+    subgraph "External JWT Flow"
+        EXT_REQ["Request with<br/>Authorization + x-slug headers"]
+        EXT_CHECK["NewExternalJWtMiddleware"]
+        EXT_SLUG["SlugFromHeader"]
+        EXT_VERIFY["VerifyExternalToken"]
+        EXT_CTX["UserInfo Context"]
+    end
+    
+    EXT_REQ --> EXT_CHECK
+    EXT_CHECK --> EXT_SLUG
+    EXT_SLUG --> EXT_VERIFY
+    EXT_VERIFY --> EXT_CTX
+```
+
+Sources: [router.go:610-647](), [router.go:649-652](), [router.go:53]()
+
+## Middleware Chain Configuration
+
+The authentication middleware chain is configured in the `NewChain` function, establishing the order of middleware execution.
+
+**Middleware Chain Structure**
+
+```mermaid
+graph TB
+    subgraph "Middleware Chain (NewChain)"
+        RECOVER["Recoverer"]
+        HEALTH["Heartbeat /_ah/health"]
+        CORS_MW["CORS Handler"]
+        RATE_MW["RateLimiterMiddleware"]
+        LOGGER["Logger Middleware"]
+        JWT_MW["JWT Middleware"]
+        CLIENT_IP["ClientIpFromHeaderMiddleware"]
+        CAPTCHA["Captcha Middlewares"]
+        USER_JWT["UserInfoFromJwtMiddleware"]
+        VERSION["Version Handler"]
+        SKIP_RIGHT["SkipRightHeaderMiddleware"]
+        API_KEY_MW["APIKeyMiddleware"]
+        SERVICE_TOK_MW["ServiceTokenMiddleware"]
+        EXT_JWT_MW["ExternalJwt Middleware"]
+        AUTH_ENFORCE["EnforceAuthenticationCheckMiddleware"]
+        ACTIVITY["TrackUserCompanyActivityLog"]
+        COMPRESS["DefaultCompress"]
+        GRPC_WEB["GrpcWeb Middleware"]
+    end
+    
+    RECOVER --> HEALTH
+    HEALTH --> CORS_MW
+    CORS_MW --> RATE_MW
+    RATE_MW --> LOGGER
+    LOGGER --> JWT_MW
+    JWT_MW --> CLIENT_IP
+    CLIENT_IP --> CAPTCHA
+    CAPTCHA --> USER_JWT
+    USER_JWT --> VERSION
+    VERSION --> SKIP_RIGHT
+    SKIP_RIGHT --> API_KEY_MW
+    API_KEY_MW --> SERVICE_TOK_MW
+    SERVICE_TOK_MW --> EXT_JWT_MW
+    EXT_JWT_MW --> AUTH_ENFORCE
+    AUTH_ENFORCE --> ACTIVITY
+    ACTIVITY --> COMPRESS
+    COMPRESS --> GRPC_WEB
+```
+
+Sources: [router.go:120-162]()
+
+## Authentication Enforcement
+
+The `EnforceAuthenticationCheckMiddleware` provides selective authentication enforcement based on URL paths and query parameters.
+
+### Enforcement Rules
+
+| Condition | Action |
+|-----------|--------|
+| `ENFORCE_AUTHENTICATION_CHECK != "true"` | Skip enforcement |
+| Path not in `/api` or `/graphql` | Skip enforcement |
+| Valid UUID in `code` query parameter | Skip enforcement |
+| No user in context | Return 401 Unauthorized |
+
+```mermaid
+graph TD
+    subgraph "Authentication Enforcement Flow"
+        ENF_REQ["Incoming Request"]
+        ENF_CHECK{"EnforceAuthenticationCheck<br/>environment variable"}
+        ENF_PATH{"Path starts with<br/>/api or /graphql?"}
+        ENF_CODE{"Valid code<br/>query parameter?"}
+        ENF_USER{"UserInfo in context?"}
+        ENF_ALLOW["Allow Request"]
+        ENF_DENY["401 Unauthorized"]
+    end
+    
+    ENF_REQ --> ENF_CHECK
+    ENF_CHECK -->|false| ENF_ALLOW
+    ENF_CHECK -->|true| ENF_PATH
+    ENF_PATH -->|false| ENF_ALLOW
+    ENF_PATH -->|true| ENF_CODE
+    ENF_CODE -->|true| ENF_ALLOW
+    ENF_CODE -->|false| ENF_USER
+    ENF_USER -->|present| ENF_ALLOW
+    ENF_USER -->|absent| ENF_DENY
+```
+
+Sources: [router.go:303-342](), [router.go:56]()
+
+## Security Features
+
+### Rate Limiting
+
+The system implements user-based and IP-based rate limiting through the `RateLimiterConfig` and associated middleware.
+
+**Rate Limiting Strategy**
+
+```mermaid
+graph TD
+    subgraph "Rate Limiting Flow"
+        RATE_REQ["Incoming Request"]
+        RATE_METHOD{"GET Request?"}
+        RATE_USER{"User Identified?"}
+        RATE_USER_LIMIT["User-based Rate Limit<br/>getVisitor(userId)"]
+        RATE_IP_LIMIT["IP-based Rate Limit<br/>getVisitor(clientIP)"]
+        RATE_ALLOW["Allow Request"]
+        RATE_DENY["429 Too Many Requests"]
+    end
+    
+    RATE_REQ --> RATE_METHOD
+    RATE_METHOD -->|Yes| RATE_ALLOW
+    RATE_METHOD -->|No| RATE_USER
+    RATE_USER -->|Yes| RATE_USER_LIMIT
+    RATE_USER -->|No| RATE_IP_LIMIT
+    RATE_USER_LIMIT -->|Within Limit| RATE_ALLOW
+    RATE_USER_LIMIT -->|Exceeded| RATE_DENY
+    RATE_IP_LIMIT -->|Within Limit| RATE_ALLOW
+    RATE_IP_LIMIT -->|Exceeded| RATE_DENY
+```
+
+Sources: [rate-limiter.go:78-120](), [rate-limiter.go:37-52]()
+
+### CORS Configuration
+
+CORS is configured with origin validation supporting both static origins and regex patterns for dynamic subdomain matching.
+
+| Origin Type | Pattern | Usage |
+|-------------|---------|-------|
+| Development | `localhost:3000-3010` | Local development |
+| Development | `localhost:6006-6016` | Additional dev ports |
+| Production | `^https:\/\/[a-z0-9A-Z.-]+.appointy.com` | Appointy subdomains |
+
+Sources: [router.go:254-301](), [router.go:124-131]()
+
+### User Activity Tracking
+
+The system tracks user-company activity timestamps for audit and analytics purposes through the `TrackUserCompanyActivityLog` middleware.
+
+```mermaid
+graph LR
+    subgraph "Activity Tracking"
+        ACT_REQ["Request with userId<br/>groupId, companyId"]
+        ACT_CACHE["Cache Check<br/>userId-companyId key"]
+        ACT_DB["Database Update<br/>user_company_activity_logs"]
+        ACT_SET["Update Cache<br/>90 minute expiry"]
+    end
+    
+    ACT_REQ --> ACT_CACHE
+    ACT_CACHE -->|Cache Miss/Expired| ACT_DB
+    ACT_DB --> ACT_SET
+    ACT_CACHE -->|Cache Hit| ACT_SET
+```
+
+Sources: [router.go:165-252](), [router.go:59]()

@@ -1,0 +1,236 @@
+# GraphQL Subscriptions
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [graphql.go](graphql.go)
+- [subscriptions.go](subscriptions.go)
+- [verify.go](verify.go)
+
+</details>
+
+
+
+This document covers the real-time GraphQL subscription system and domain verification endpoints implemented in the waqt-deployment service. The GraphQL subscriptions enable clients to receive real-time updates for appointments, notifications, and block hours, while the domain verification endpoints support third-party service integrations.
+
+For information about GraphQL schema registration and federation, see [GraphQL Gateway](#2.2). For details about the broader GraphQL API structure, see [GraphQL API](#4.1).
+
+## Purpose and Scope
+
+The GraphQL subscription system provides real-time data streaming capabilities for critical business entities including appointments, notifications, and resource availability. The subscription handlers implement sophisticated filtering and access control mechanisms. Additionally, the service exposes domain verification endpoints required for integration with external services like Google, Zoom, Microsoft, and Twilio.
+
+## GraphQL Subscription Architecture
+
+The subscription system is built on the `schemabuilder.Schema` from the Jaal GraphQL library and integrates with multiple backend services through gRPC clients.
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        WEB_CLIENT["Web Client"]
+        MOBILE_CLIENT["Mobile Client"]
+    end
+    
+    subgraph "GraphQL Subscription System"
+        SCHEMA_BUILDER["schemabuilder.Schema"]
+        
+        subgraph "Subscription Handlers"
+            APPT_SUB["appointments subscription"]
+            NOTIF_SUB["notifications subscription"] 
+            BLOCK_SUB["blockHours subscription"]
+            TEST_SUB["shivam subscription"]
+        end
+        
+        subgraph "Payload Processing"
+            PROTO_UNMARSHAL["proto.Unmarshal"]
+            JSON_UNMARSHAL["json.Unmarshal"]
+            FILTER_LOGIC["Filtering Logic"]
+        end
+    end
+    
+    subgraph "Backend Services"
+        APT_CLIENT["aptPb.AppointmentsClient"]
+        BLOCK_CLIENT["blockPb.BlockHoursClient"] 
+        NOTIF_CLIENT["webPb.WebNotificationsClient"]
+    end
+    
+    subgraph "Data Sources"
+        APT_HANDLER["appointment.SubscriptionHandler"]
+        BLOCK_HANDLER["blockHour.SubscriptionHandler"]
+        NOTIF_HANDLER["notification.SubscriptionHandler"]
+    end
+    
+    WEB_CLIENT --> SCHEMA_BUILDER
+    MOBILE_CLIENT --> SCHEMA_BUILDER
+    
+    SCHEMA_BUILDER --> APPT_SUB
+    SCHEMA_BUILDER --> NOTIF_SUB
+    SCHEMA_BUILDER --> BLOCK_SUB
+    SCHEMA_BUILDER --> TEST_SUB
+    
+    APPT_SUB --> PROTO_UNMARSHAL
+    NOTIF_SUB --> PROTO_UNMARSHAL
+    BLOCK_SUB --> PROTO_UNMARSHAL
+    TEST_SUB --> JSON_UNMARSHAL
+    
+    PROTO_UNMARSHAL --> FILTER_LOGIC
+    JSON_UNMARSHAL --> FILTER_LOGIC
+    
+    FILTER_LOGIC --> APT_HANDLER
+    FILTER_LOGIC --> BLOCK_HANDLER
+    FILTER_LOGIC --> NOTIF_HANDLER
+    
+    APT_HANDLER --> APT_CLIENT
+    BLOCK_HANDLER --> BLOCK_CLIENT
+    NOTIF_HANDLER --> NOTIF_CLIENT
+```
+
+**Sources:** [subscriptions.go:18-167]()
+
+## Subscription Types
+
+The system implements four distinct subscription types, each with specific filtering capabilities and data structures.
+
+### Appointments Subscription
+
+The `appointments` subscription provides real-time updates for appointment changes with comprehensive filtering options.
+
+| Filter Parameter | Type | Purpose |
+|------------------|------|---------|
+| `Parents` | `[]string` | Filter by organizational hierarchy |
+| `EmployeeIds` | `[]string` | Filter by specific employees |
+| `ServiceIds` | `[]string` | Filter by service types |
+| `ResourceIds` | `[]string` | Filter by specific resources |
+| `ResourceTypeIds` | `[]string` | Filter by resource categories |
+| `StartTime` | `schemabuilder.Timestamp` | Filter by time range start |
+| `EndTime` | `schemabuilder.Timestamp` | Filter by time range end |
+
+The subscription handler performs access control validation using `idutil.GetParent()` and the `contains()` utility function before delegating to `appointment.SubscriptionHandler()`.
+
+**Sources:** [subscriptions.go:46-89]()
+
+### Notifications Subscription
+
+The `notifications` subscription streams web notification updates with user-specific filtering.
+
+```mermaid
+graph LR
+    subgraph "Notification Flow"
+        PAYLOAD["source.Payload"]
+        UNMARSHAL["proto.Unmarshal"]
+        WEB_NOTIF["webPb.WebNotification"]
+        USER_CHECK["UserId Validation"]
+        HANDLER["notification.SubscriptionHandler"]
+    end
+    
+    PAYLOAD --> UNMARSHAL
+    UNMARSHAL --> WEB_NOTIF
+    WEB_NOTIF --> USER_CHECK
+    USER_CHECK --> HANDLER
+```
+
+The subscription accepts filtering parameters including `UserId`, `Locale`, `EventType`, and `NotificationStatusType` from the `webPb.NotificationStatusType` enum.
+
+**Sources:** [subscriptions.go:91-118]()
+
+### Block Hours Subscription
+
+The `blockHours` subscription monitors resource availability changes and blocked time periods.
+
+The filtering logic includes validation for:
+- Organizational parents using `idutil.GetParent(blk.Id)`
+- Employee and resource ID matching
+- Time range constraints via `StartTime` and `EndTime`
+
+**Sources:** [subscriptions.go:120-166]()
+
+### Test Subscription
+
+The `shivam` subscription serves as a development/testing endpoint that processes JSON payloads and returns `userPb.UserProfile` objects.
+
+**Sources:** [subscriptions.go:24-44]()
+
+## Domain Verification System
+
+The service implements domain verification endpoints required for third-party service integrations. These endpoints are registered as HTTP routes through the `router.RouteFunc` pattern.
+
+```mermaid
+graph TB
+    subgraph "Domain Verification Endpoints"
+        GOOGLE["/googleccd40724f8c32619.html"]
+        ZOOM["/zoomverify/verifyzoom.html"]
+        MICROSOFT["/.well-known/microsoft-identity-association.json"]
+        TWILIO["/.tls-check/twilio"]
+    end
+    
+    subgraph "Verification Responses"
+        GOOGLE_RESP["google-site-verification: googleccd40724f8c32619.html"]
+        ZOOM_RESP["06dd685d9c4449388a6f136fdd3118b7"]
+        MS_RESP["JSON with applicationId"]
+        TWILIO_RESP["TLS Check Results"]
+    end
+    
+    subgraph "External Services"
+        GOOGLE_CONSOLE["Google Search Console"]
+        ZOOM_API["Zoom API"]
+        MS_IDENTITY["Microsoft Identity"]
+        TWILIO_API["Twilio API"]
+    end
+    
+    GOOGLE --> GOOGLE_RESP
+    ZOOM --> ZOOM_RESP
+    MICROSOFT --> MS_RESP
+    TWILIO --> TWILIO_RESP
+    
+    GOOGLE_RESP --> GOOGLE_CONSOLE
+    ZOOM_RESP --> ZOOM_API
+    MS_RESP --> MS_IDENTITY
+    TWILIO_RESP --> TWILIO_API
+```
+
+### Verification Endpoints
+
+| Endpoint | Purpose | Response Type |
+|----------|---------|---------------|
+| `/googleccd40724f8c32619.html` | Google Search Console verification | Plain text |
+| `/zoomverify/verifyzoom.html` | Zoom API domain verification | Plain text hash |
+| `/.well-known/microsoft-identity-association.json` | Microsoft Identity verification | JSON with `applicationId` |
+| `/.tls-check/twilio` | Twilio TLS connectivity test | HTTP proxy response |
+
+**Sources:** [verify.go:14-64]()
+
+## Implementation Details
+
+### Error Handling
+
+The subscription system uses `graphql.ErrNoUpdate` to signal when no update should be sent to subscribers. This occurs in several scenarios:
+
+- Protobuf unmarshaling failures
+- Access control filter mismatches
+- Invalid payload data
+
+**Sources:** [subscriptions.go:36,62,104,135]()
+
+### Access Control Integration
+
+Each subscription implements hierarchical access control by validating:
+
+1. **Parent Organization**: Using `idutil.GetParent()` to extract organizational hierarchy
+2. **Resource Ownership**: Matching employee, service, and resource IDs
+3. **Time-based Filtering**: Applying temporal constraints through timestamp validation
+
+### Dependency Injection
+
+The subscription registration follows the fx dependency injection pattern, requiring:
+
+- `*schemabuilder.Schema` for GraphQL schema registration
+- gRPC clients for backend service communication (`blockPb.BlockHoursClient`, `aptPb.AppointmentsClient`, `webPb.WebNotificationsClient`)
+
+**Sources:** [subscriptions.go:18-22]()
+
+### Utility Functions
+
+The `contains()` helper function provides slice membership testing for string arrays, supporting the filtering logic across all subscription types.
+
+**Sources:** [subscriptions.go:169-177]()

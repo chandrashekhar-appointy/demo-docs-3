@@ -1,0 +1,408 @@
+# HTTP Endpoints
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [rate-limiter.go](rate-limiter.go)
+- [redis/redis.go](redis/redis.go)
+- [router.go](router.go)
+- [subscriptions.go](subscriptions.go)
+- [verify.go](verify.go)
+
+</details>
+
+
+
+This document covers the HTTP routing system, middleware chain, and endpoint implementations in the waqt-deployment service. It details how HTTP requests are processed through the middleware pipeline, authenticated, and routed to appropriate handlers.
+
+For GraphQL-specific endpoint handling, see [GraphQL API](#4.1). For gRPC service implementations, see [gRPC Services](#4.2). For authentication middleware details, see [Authentication Middleware](#5.2).
+
+## HTTP Router Architecture
+
+The HTTP routing system is built using the `go-chi/chi` router with a sophisticated middleware chain implemented through the `justinas/alice` package. The router handles multiple types of endpoints including GraphQL, gRPC-Web, and domain verification endpoints.
+
+```mermaid
+graph TD
+    HTTP_REQUEST["HTTP Request"] --> MIDDLEWARE_CHAIN["alice.Chain Middleware"]
+    MIDDLEWARE_CHAIN --> ROUTER_MUX["Chi Router / gRPC Gateway"]
+    
+    ROUTER_MUX --> GRAPHQL_ENDPOINT["GraphQL Endpoint<br/>/graphql"]
+    ROUTER_MUX --> GRPC_WEB["gRPC-Web Gateway<br/>/api/v1/*"]
+    ROUTER_MUX --> DOMAIN_VERIFY["Domain Verification<br/>/.well-known/*"]
+    ROUTER_MUX --> HEALTH_CHECK["Health Check<br/>/_ah/health"]
+    
+    MIDDLEWARE_CHAIN --> RECOVERER["Recoverer"]
+    MIDDLEWARE_CHAIN --> CORS["CORS Handler"]
+    MIDDLEWARE_CHAIN --> RATE_LIMITER["RateLimiterMiddleware"]
+    MIDDLEWARE_CHAIN --> COMPRESSOR["DefaultCompress"]
+    MIDDLEWARE_CHAIN --> LOGGER["Logger Middleware"]
+    MIDDLEWARE_CHAIN --> JWT_AUTH["JWT Middleware"]
+    MIDDLEWARE_CHAIN --> CLIENT_IP["ClientIpFromHeaderMiddleware"]
+    MIDDLEWARE_CHAIN --> API_KEY["APIKeyMiddleware"]
+    MIDDLEWARE_CHAIN --> SERVICE_TOKEN["ServiceTokenMiddleware"]
+    MIDDLEWARE_CHAIN --> EXTERNAL_JWT["ExternalJWtMiddleware"]
+    MIDDLEWARE_CHAIN --> AUTH_CHECK["EnforceAuthenticationCheckMiddleware"]
+    MIDDLEWARE_CHAIN --> ACTIVITY_LOG["TrackUserCompanyActivityLog"]
+    
+    style HTTP_REQUEST fill:#f9f9f9
+    style MIDDLEWARE_CHAIN fill:#e1f5fe
+    style ROUTER_MUX fill:#fff3e0
+```
+
+**Sources:** [router.go:100-163](), [router.go:535-538]()
+
+## Middleware Chain Configuration
+
+The middleware chain is configured in the `NewChain` function and processes requests in a specific order to ensure proper authentication, logging, and request handling.
+
+```mermaid
+graph TD
+    subgraph "Core Middleware"
+        RECOVERER["Recoverer<br/>Panic Recovery"]
+        HEARTBEAT["middleware.Heartbeat<br/>/_ah/health"]
+        CORS_MW["cors.New<br/>Cross-Origin Handling"]
+        RATE_LIMIT["RateLimiterMiddleware<br/>Request Throttling"]
+        COMPRESS["middleware.DefaultCompress<br/>Response Compression"]
+    end
+    
+    subgraph "Authentication Layer"
+        LOGGER_MW["Logger Middleware"]
+        JWT_MW["JWT Middleware"]
+        CLIENT_IP_MW["ClientIpFromHeaderMiddleware"]
+        CAPTCHA_MW["SetCaptchaResponseInContext"]
+        GOOGLE_CAPTCHA["SetGoogleCaptchaResponseInContext"]
+        USER_INFO["auth.UserInfoFromJwtMiddleware"]
+        VERSION_MW["version.Handler"]
+        SKIP_RIGHT["graphql.SkipRightHeaderMiddleware"]
+        API_KEY_MW["APIKeyMiddleware"]
+        SERVICE_TOKEN_MW["ServiceTokenMiddleware"]
+        EXTERNAL_JWT_MW["ExternalJWtMiddleware"]
+    end
+    
+    subgraph "Security & Tracking"
+        AUTH_ENFORCE["EnforceAuthenticationCheckMiddleware"]
+        ACTIVITY_TRACK["TrackUserCompanyActivityLog"]
+    end
+    
+    subgraph "Final Handlers"
+        OIDC_MW["OIDC Middleware"]
+        GRPC_WEB_MW["gRPC-Web Middleware"]
+    end
+    
+    RECOVERER --> HEARTBEAT
+    HEARTBEAT --> CORS_MW
+    CORS_MW --> RATE_LIMIT
+    RATE_LIMIT --> COMPRESS
+    COMPRESS --> LOGGER_MW
+    LOGGER_MW --> JWT_MW
+    JWT_MW --> CLIENT_IP_MW
+    CLIENT_IP_MW --> CAPTCHA_MW
+    CAPTCHA_MW --> GOOGLE_CAPTCHA
+    GOOGLE_CAPTCHA --> USER_INFO
+    USER_INFO --> VERSION_MW
+    VERSION_MW --> SKIP_RIGHT
+    SKIP_RIGHT --> API_KEY_MW
+    API_KEY_MW --> SERVICE_TOKEN_MW
+    SERVICE_TOKEN_MW --> EXTERNAL_JWT_MW
+    EXTERNAL_JWT_MW --> AUTH_ENFORCE
+    AUTH_ENFORCE --> ACTIVITY_TRACK
+    ACTIVITY_TRACK --> OIDC_MW
+    OIDC_MW --> GRPC_WEB_MW
+```
+
+**Sources:** [router.go:100-163](), [router.go:121-148]()
+
+## Authentication Methods
+
+The system supports multiple authentication methods that are processed through dedicated middleware components:
+
+| Authentication Type | Header/Source | Middleware Function | Purpose |
+|---------------------|---------------|-------------------|---------|
+| JWT Token | `Authorization: Bearer <token>` | JWT Middleware | Standard user authentication |
+| API Key | `X-API-KEY` | `APIKeyMiddleware` | Service-to-service authentication via `ValidateApiKey` |
+| Service Token | `X-Service-Token` | `ServiceTokenMiddleware` | Internal service authentication |
+| External JWT | `Authorization` + `x-slug` | `ExternalJWtMiddleware` | Slug-based external authentication via `VerifyExternalToken` |
+
+### API Key Authentication Details
+
+The `APIKeyMiddleware` validates API keys through the `apiKeypb.ApiKeysClient.ValidateApiKey` service and resolves user profiles:
+
+```mermaid
+graph LR
+    API_REQUEST["Request with X-API-KEY"] --> API_VALIDATE["apiKeyClient.ValidateApiKey"]
+    API_VALIDATE --> USER_LOOKUP["userClient.GetUserProfile"]
+    USER_LOOKUP --> USER_CONTEXT["Set UserInfo Context"]
+    
+    API_VALIDATE -->|Error| ZAPIER_CHECK{"Path contains<br/>'zapier'?"}
+    ZAPIER_CHECK -->|Yes| REJECT_401["401 Unauthorized<br/>'No Api key configured'"]
+    ZAPIER_CHECK -->|No| CONTINUE_NO_AUTH["Continue without auth"]
+```
+
+### External JWT Authentication
+
+The `ExternalJWtMiddleware` supports company-specific JWT validation using slug-based routing:
+
+```mermaid
+graph LR
+    EXT_REQUEST["Request with Authorization + x-slug"] --> SLUG_EXTRACT["SlugFromHeader"]
+    SLUG_EXTRACT --> TOKEN_EXTRACT["TokenFromHeader"]
+    TOKEN_EXTRACT --> EXT_VERIFY["userCli.VerifyExternalToken"]
+    EXT_VERIFY --> EXT_CONTEXT["Set UserInfo Context"]
+    
+    EXT_VERIFY -->|Error| LOG_DEBUG["Debug Log Error"]
+    LOG_DEBUG --> CONTINUE_UNAUTH["Continue Unauthenticated"]
+```
+
+```mermaid
+graph LR
+    REQUEST["HTTP Request"] --> AUTH_DETECTION["Authentication Detection"]
+    
+    AUTH_DETECTION --> JWT_PATH["JWT Token Path"]
+    AUTH_DETECTION --> API_KEY_PATH["API Key Path"]
+    AUTH_DETECTION --> SERVICE_TOKEN_PATH["Service Token Path"]
+    AUTH_DETECTION --> EXTERNAL_JWT_PATH["External JWT Path"]
+    
+    JWT_PATH --> USER_RESOLUTION["UserInfoFromJwtMiddleware<br/>User Profile Resolution"]
+    API_KEY_PATH --> API_VALIDATION["ValidateApiKey<br/>API Key Service"]
+    SERVICE_TOKEN_PATH --> SERVICE_VALIDATION["Service Token Validation"]
+    EXTERNAL_JWT_PATH --> EXTERNAL_VALIDATION["VerifyExternalToken<br/>Slug-based Validation"]
+    
+    USER_RESOLUTION --> USER_CONTEXT["UserInfo Context"]
+    API_VALIDATION --> USER_CONTEXT
+    SERVICE_VALIDATION --> USER_CONTEXT
+    EXTERNAL_VALIDATION --> USER_CONTEXT
+    
+    USER_CONTEXT --> REQUEST_PROCESSING["Request Processing"]
+```
+
+**Sources:** [router.go:140](), [router.go:558-608](), [router.go:610-647]()
+
+## User Activity Tracking
+
+The `TrackUserCompanyActivityLog` middleware implements sophisticated user activity tracking for analytics purposes. It records the last activity timestamp for each user-company pair to track engagement patterns.
+
+```mermaid
+graph TD
+    ACTIVITY_MW["TrackUserCompanyActivityLog"] --> QUERY_CHECK{"URL Query<br/>Parameters Present?"}
+    
+    QUERY_CHECK -->|No| SKIP_TRACKING["Skip Tracking"]
+    QUERY_CHECK -->|Yes| ENV_CHECK{"TRACK_USER_COMPANY_ACTIVITY_TIMESTAMP<br/>= true?"}
+    
+    ENV_CHECK -->|No| SKIP_TRACKING
+    ENV_CHECK -->|Yes| PARAM_EXTRACT["Extract userId, groupId, companyId"]
+    
+    PARAM_EXTRACT --> PARAM_VALIDATE{"All Parameters<br/>Present?"}
+    PARAM_VALIDATE -->|No| SKIP_TRACKING
+    PARAM_VALIDATE -->|Yes| CACHE_CHECK["Check Redis Cache"]
+    
+    CACHE_CHECK --> CACHE_HIT{"Cache Hit &<br/>< 1 Hour Ago?"}
+    CACHE_HIT -->|Yes| SKIP_TRACKING
+    CACHE_HIT -->|No| DB_CHECK["Query Database<br/>user_company_activity_logs"]
+    
+    DB_CHECK --> DB_EXISTS{"Record Exists &<br/>< 1 Hour Ago?"}
+    DB_EXISTS -->|Yes| CACHE_UPDATE["Update Cache Only"]
+    DB_EXISTS -->|No| DB_UPDATE["Insert/Update Database<br/>& Cache"]
+    
+    SKIP_TRACKING --> CONTINUE["Continue Request"]
+    CACHE_UPDATE --> CONTINUE
+    DB_UPDATE --> CONTINUE
+```
+
+The middleware uses a two-tier caching strategy:
+- **Redis Cache**: 90-minute expiry for frequently accessed records
+- **Database**: Persistent storage with hourly granularity to prevent excessive writes
+
+| Component | Configuration | Purpose |
+|-----------|---------------|---------|
+| Cache Key Format | `${userId}-${groupId}/${companyId}` | Unique user-company identifier |
+| Cache Expiry | 90 minutes | Reduces database queries |
+| Update Frequency | 1 hour minimum | Prevents excessive database writes |
+| Table Schema | `user_company_activity_logs` | Persistent activity tracking |
+
+**Sources:** [router.go:165-252]()
+
+## gRPC Interceptor Chain
+
+Alongside HTTP middleware, the service configures gRPC interceptors for internal service communication:
+
+```mermaid
+graph TD
+    GRPC_REQUEST["gRPC Request"] --> INTERCEPTOR_CHAIN["NewInterceptors"]
+    
+    INTERCEPTOR_CHAIN --> RECOVERY["grpcrecovery.UnaryServerInterceptor<br/>Panic Recovery"]
+    RECOVERY --> JWT_INTERCEPTOR["JWT Interceptor"]
+    JWT_INTERCEPTOR --> GRPC_WRAPPER["GrpcWrapper Interceptor"]
+    GRPC_WRAPPER --> USER_INFO_GRPC["auth.UserInfoFromJwtUnaryInterceptor"]
+    USER_INFO_GRPC --> CLIENT_IP_GRPC["ClientIpInterceptor"]
+    CLIENT_IP_GRPC --> VERSION_GRPC["version.Interceptor"]
+    VERSION_GRPC --> LOG_INTERCEPTOR["LogInterceptor"]
+    LOG_INTERCEPTOR --> IDENTIFY_GRPC["IdentifyGrpcCall"]
+    
+    IDENTIFY_GRPC --> GRPC_HANDLER["gRPC Handler"]
+```
+
+**Sources:** [router.go:388-406]()
+
+## Domain Verification Endpoints
+
+The system provides several domain verification endpoints for third-party service integrations, implemented through the `DomainVerification` fx module:
+
+```mermaid
+graph TD
+    subgraph "Domain Verification Routes"
+        GOOGLE_VERIFY["/googleccd40724f8c32619.html<br/>Google Site Verification"]
+        ZOOM_VERIFY["/zoomverify/verifyzoom.html<br/>Zoom Domain Verification"]
+        MS_IDENTITY["/.well-known/microsoft-identity-association.json<br/>Microsoft Identity Association"]
+        TWILIO_TLS["/.tls-check/twilio<br/>Twilio TLS Connectivity Check"]
+    end
+    
+    GOOGLE_VERIFY --> GOOGLE_RESPONSE["Returns: google-site-verification token"]
+    ZOOM_VERIFY --> ZOOM_RESPONSE["Returns: Static verification hash"]
+    MS_IDENTITY --> MS_RESPONSE["Returns: JSON with applicationId"]
+    TWILIO_TLS --> TWILIO_RESPONSE["Returns: Twilio API connectivity test"]
+```
+
+| Endpoint | Purpose | Response Type | Implementation |
+|----------|---------|---------------|----------------|
+| `/googleccd40724f8c32619.html` | Google Search Console verification | Plain text verification token | Static string response |
+| `/zoomverify/verifyzoom.html` | Zoom app domain verification | Static hash: `06dd685d9c4449388a6f136fdd3118b7` | Static string response |
+| `/.well-known/microsoft-identity-association.json` | Microsoft Azure AD verification | JSON with application ID `51928232-418d-46ad-b90f-dd1aa4eafbcf` | JSON response with Content-Type header |
+| `/.tls-check/twilio` | Twilio webhook TLS verification | Twilio API connectivity test results | Live HTTP test to `api.twilio.com:8443` |
+
+The Twilio TLS check endpoint performs a live connectivity test and returns detailed connection information including headers, content length, and response body.
+
+**Sources:** [verify.go:14-64]()
+
+## Request Processing Pipeline
+
+The complete request processing pipeline shows how HTTP requests flow through the system:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Middleware as "alice.Chain"
+    participant Auth as "Authentication Layer"
+    participant Router as "Chi Router"
+    participant Handler as "Endpoint Handler"
+    
+    Client->>Middleware: HTTP Request
+    Middleware->>Middleware: Recoverer (Panic Recovery)
+    Middleware->>Middleware: CORS Validation
+    Middleware->>Middleware: Rate Limiting Check
+    Middleware->>Middleware: Request Compression
+    
+    Middleware->>Auth: Authentication Processing
+    Auth->>Auth: Extract JWT/API Key/Service Token
+    Auth->>Auth: Validate Credentials
+    Auth->>Auth: Resolve User Profile
+    Auth->>Auth: Set UserInfo Context
+    
+    Auth->>Middleware: Authenticated Request
+    Middleware->>Middleware: Activity Logging
+    Middleware->>Middleware: Version Header
+    
+    Middleware->>Router: Route Resolution
+    Router->>Handler: Execute Handler
+    Handler->>Router: Response
+    Router->>Client: HTTP Response
+```
+
+**Sources:** [router.go:100-163](), [router.go:165-252]()
+
+## Rate Limiting Implementation
+
+The rate limiting system uses token bucket algorithm with per-user and per-IP limits, implemented through the `RateLimiterConfig` struct:
+
+```mermaid
+graph TD
+    REQUEST_RATE["Incoming Request"] --> RATE_CHECK["RateLimiterMiddleware"]
+    
+    RATE_CHECK --> ENABLED_CHECK{"RateLimiterConfig.Enable<br/>= true?"}
+    ENABLED_CHECK -->|No| BYPASS["Bypass Rate Limiting"]
+    ENABLED_CHECK -->|Yes| METHOD_CHECK{"HTTP Method<br/>GET?"}
+    
+    METHOD_CHECK -->|Yes| BYPASS
+    METHOD_CHECK -->|No| USER_CHECK{"userinfo.FromContext<br/>User ID Present?"}
+    
+    USER_CHECK -->|Yes| USER_LIMITER["getVisitor(userId)<br/>rate.NewLimiter"]
+    USER_CHECK -->|No| IP_LIMITER["getVisitor(clientIP)<br/>userinfo.GetClientIP"]
+    
+    USER_LIMITER --> TOKEN_CHECK{"limiter.Allow()?"}
+    IP_LIMITER --> TOKEN_CHECK
+    
+    TOKEN_CHECK -->|Yes| ALLOW["Allow Request"]
+    TOKEN_CHECK -->|No| REJECT["429 Too Many Requests<br/>http.StatusTooManyRequests"]
+    
+    BYPASS --> CONTINUE["Continue Processing"]
+    ALLOW --> CONTINUE
+    REJECT --> ERROR_RESPONSE["Error Response"]
+```
+
+The rate limiter maintains a global `visitors` map with background cleanup via the `cleanupVisitors` goroutine:
+
+| Component | Configuration | Default Value | Implementation |
+|-----------|---------------|---------------|----------------|
+| Rate Limit | Requests per second | 10 | `rate.Limit(config.Rate)` |
+| Burst Limit | Maximum burst requests | 20 | `rate.NewLimiter` burst parameter |
+| Cleanup Interval | Visitor map cleanup | 1 minute | Background goroutine with `time.Sleep` |
+| Visitor Expiry | Inactive visitor removal | 3 minutes | `time.Since(v.lastSeen)` check |
+| Visitor Storage | In-memory map | `map[string]*visitor` | Protected by `sync.Mutex` |
+
+**Sources:** [rate-limiter.go:12-134](), [router.go:132]()
+
+## CORS Configuration
+
+Cross-Origin Resource Sharing (CORS) is configured with dynamic origin validation:
+
+```mermaid
+graph TD
+    CORS_REQUEST["CORS Request"] --> ORIGIN_CHECK["CheckCors Function"]
+    
+    ORIGIN_CHECK --> CONFIG_CHECK{"CorsConfig<br/>Enabled?"}
+    CONFIG_CHECK -->|No| ALLOW_ALL["Allow All Origins"]
+    CONFIG_CHECK -->|Yes| ORIGIN_VALIDATION["Origin Validation"]
+    
+    ORIGIN_VALIDATION --> LOCALHOST_CHECK["Localhost Ports<br/>3000-3010, 6006-6016"]
+    ORIGIN_VALIDATION --> REGEX_CHECK["Regex Pattern<br/>*.appointy.com"]
+    
+    LOCALHOST_CHECK --> MATCH_FOUND{"Match Found?"}
+    REGEX_CHECK --> MATCH_FOUND
+    
+    MATCH_FOUND -->|Yes| ALLOW_ORIGIN["Allow Origin"]
+    MATCH_FOUND -->|No| DENY_ORIGIN["Deny Origin"]
+    
+    ALLOW_ALL --> CONTINUE["Continue Request"]
+    ALLOW_ORIGIN --> CONTINUE
+    DENY_ORIGIN --> CORS_ERROR["CORS Error"]
+```
+
+**Sources:** [router.go:124-131](), [router.go:254-301]()
+
+## Authentication Enforcement
+
+The `EnforceAuthenticationCheckMiddleware` provides selective authentication requirements:
+
+```mermaid
+graph TD
+    AUTH_ENFORCE["EnforceAuthenticationCheckMiddleware"] --> ENV_CHECK{"ENFORCE_AUTHENTICATION_CHECK<br/>= true?"}
+    
+    ENV_CHECK -->|No| ALLOW_REQUEST["Allow Request"]
+    ENV_CHECK -->|Yes| PATH_CHECK["Check URL Path"]
+    
+    PATH_CHECK --> PREFIX_CHECK{"Path starts with<br/>/api or /graphql?"}
+    PREFIX_CHECK -->|No| ALLOW_REQUEST
+    PREFIX_CHECK -->|Yes| CODE_CHECK{"Valid UUID code<br/>in query params?"}
+    
+    CODE_CHECK -->|Yes| ALLOW_REQUEST
+    CODE_CHECK -->|No| USER_CHECK{"User ID present<br/>in context?"}
+    
+    USER_CHECK -->|Yes| ALLOW_REQUEST
+    USER_CHECK -->|No| REJECT_UNAUTH["401 Unauthorized<br/>{\"error\": \"unauthenticated\"}"]
+    
+    style REJECT_UNAUTH fill:#ffebee
+    style ALLOW_REQUEST fill:#e8f5e8
+```
+
+**Sources:** [router.go:303-342]()

@@ -1,0 +1,191 @@
+# Profession Setup
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [connections.go](connections.go)
+- [profession-setup/setup.go](profession-setup/setup.go)
+
+</details>
+
+
+
+## Purpose and Scope
+
+The Profession Setup system provides profession-based initialization workflows for new business entities within the waqt platform. It automates the creation of resource types and other business entities based on predefined profession templates, streamlining onboarding for businesses in specific industries.
+
+For information about general resource management, see [Resource Management](#6.2). For license-based feature management, see [License Management](#6.4).
+
+## System Architecture
+
+The profession setup system operates as a gRPC service that bridges profession templates with concrete business entity creation:
+
+```mermaid
+graph TB
+    subgraph "Profession Setup Service"
+        PSS["professionSetupServer"]
+        SFP["SetupFromProfession()"]
+    end
+    
+    subgraph "External Services"
+        PROF["profession/pb<br/>ProfessionsClient"]
+        RT["resource-type/pb<br/>ResourceTypesClient"]
+    end
+    
+    subgraph "Data Flow"
+        REQ["SetupFromProfessionRequest"]
+        PROF_DATA["Profession.SetupData"]
+        RT_BATCH["BatchCreateResourceTypeRequest"]
+    end
+    
+    REQ --> SFP
+    SFP --> PROF_DATA
+    PROF_DATA --> RT_BATCH
+    SFP --> RT
+    
+    PSS --> RT
+    PROF --> PSS
+```
+
+Sources: [profession-setup/setup.go:1-54]()
+
+## Core Components
+
+### ProfessionSetupServer
+
+The `professionSetupServer` implements the `pb.SetupProfessionServer` interface and serves as the main entry point for profession-based setup operations.
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `professionSetupServer` | struct | Main service implementation |
+| `rstCli` | `rtPb.ResourceTypesClient` | Client for resource type operations |
+| `SetupFromProfession` | method | Primary setup workflow handler |
+
+Sources: [profession-setup/setup.go:18-24]()
+
+### Module Registration
+
+The profession setup module is registered using the fx dependency injection framework:
+
+```mermaid
+graph LR
+    MODULE["profession_setup.Module"]
+    PSS["NewProfessionSetupServer"]
+    LOCAL["pb.NewLocalSetupProfessionClient"]
+    
+    MODULE --> PSS
+    MODULE --> LOCAL
+```
+
+Sources: [profession-setup/setup.go:11-16]()
+
+## Setup Workflow
+
+The profession setup process follows a structured workflow that transforms profession templates into concrete business resources:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant PSS as "professionSetupServer"
+    participant RT as "ResourceTypesClient"
+    
+    Client->>PSS: SetupFromProfessionRequest
+    Note over PSS: Extract profession.setupData.resourceTypes
+    
+    loop For each resource type
+        PSS->>PSS: Create ResourceType entity
+        PSS->>PSS: Set IDENTIFIABLE/NON_IDENTIFIABLE
+        PSS->>PSS: Configure capacity if needed
+    end
+    
+    PSS->>RT: BatchCreateResourceType
+    RT-->>PSS: Created resource types
+    PSS-->>Client: empty.Empty (success)
+```
+
+Sources: [profession-setup/setup.go:27-53]()
+
+## Resource Type Creation Process
+
+The system processes profession resource type templates and creates corresponding `ResourceType` entities:
+
+### Resource Type Mapping
+
+| Profession Template Field | ResourceType Field | Logic |
+|---------------------------|-------------------|-------|
+| `rt.Name` | `Name` | Direct mapping |
+| `rt.IsIdentifiable` | `ResourceTypesType` | `IDENTIFIABLE` if true, `NON_IDENTIFIABLE` if false |
+| N/A | `Active` | Always set to `true` |
+| N/A | `Capacity` | Set to `1` for non-identifiable types |
+
+### Processing Logic
+
+```mermaid
+flowchart TD
+    START["profession.setupData.resourceTypes[]"]
+    LOOP["For each resourceType"]
+    CREATE["Create rtPb.ResourceType"]
+    
+    CHECK_ID{"rt.IsIdentifiable?"}
+    SET_IDENTIFIABLE["ResourceTypesType = IDENTIFIABLE"]
+    SET_NON_ID["ResourceTypesType = NON_IDENTIFIABLE<br/>Capacity = 1"]
+    
+    COLLECT["Append to resourceTypes array"]
+    BATCH_CREATE["BatchCreateResourceType()"]
+    END["Return empty.Empty"]
+    
+    START --> LOOP
+    LOOP --> CREATE
+    CREATE --> CHECK_ID
+    CHECK_ID -->|true| SET_IDENTIFIABLE
+    CHECK_ID -->|false| SET_NON_ID
+    SET_IDENTIFIABLE --> COLLECT
+    SET_NON_ID --> COLLECT
+    COLLECT --> BATCH_CREATE
+    BATCH_CREATE --> END
+```
+
+Sources: [profession-setup/setup.go:29-50]()
+
+## Integration Points
+
+### GraphQL Integration
+
+The profession setup system integrates with the GraphQL layer through data loaders and connections:
+
+```mermaid
+graph TB
+    subgraph "GraphQL Layer"
+        PROF_LOADER["professionLoader"]
+        BATCH_GET["BatchGetProfessionByName"]
+    end
+    
+    subgraph "Setup Service"
+        PSS["professionSetupServer"]
+    end
+    
+    subgraph "Data Sources"
+        PROF_SERVICE["profession/pb service"]
+    end
+    
+    PROF_LOADER --> BATCH_GET
+    BATCH_GET --> PROF_SERVICE
+    PSS --> PROF_SERVICE
+```
+
+The `professionLoader` in the GraphQL connections handles profession data loading by name, supporting the profession template system.
+
+Sources: [connections.go:796-809]()
+
+### Dependency Injection
+
+The system uses fx.Options for dependency injection configuration:
+
+| Provider | Returns | Dependencies |
+|----------|---------|--------------|
+| `NewProfessionSetupServer` | `pb.SetupProfessionServer` | `rtPb.ResourceTypesClient` |
+| `pb.NewLocalSetupProfessionClient` | Local client interface | - |
+
+Sources: [profession-setup/setup.go:11-16](), [profession-setup/setup.go:22-24]()

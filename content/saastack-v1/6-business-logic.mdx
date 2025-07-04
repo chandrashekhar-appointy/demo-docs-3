@@ -1,0 +1,308 @@
+# Business Logic
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [discount-items/consumable_item.go](discount-items/consumable_item.go)
+- [discount-items/fx.go](discount-items/fx.go)
+- [discount-items/items.go](discount-items/items.go)
+- [links/fx.go](links/fx.go)
+- [links/go.mod](links/go.mod)
+- [links/link_types.go](links/link_types.go)
+- [links/staff_private_url.go](links/staff_private_url.go)
+- [membership-items/wallet_order_items.go](membership-items/wallet_order_items.go)
+
+</details>
+
+
+
+This document covers the core business logic implementations within the Waqt deployment system. The business logic layer contains domain-specific operations for membership management, entity relationship validation, and staff workflow automation. These components handle complex business rules, payment processing, subscription management, and inter-service relationship validation.
+
+For authentication and authorization logic, see [Authentication & Authorization](#2.3). For API layer implementation details, see [API Layer](#4).
+
+## Core Business Domains
+
+The business logic is organized into two primary domains that handle distinct business concerns:
+
+| Domain | Purpose | Primary Services |
+|--------|---------|------------------|
+| **Membership Items** | E-commerce operations for membership purchases, subscription billing, and wallet management | `WalletOrderItemResult`, `BenefitServiceServer`, `MembershipWalletItemConsumptionServiceServer` |
+| **Link Management** | Entity relationship validation and staff workflow automation | `LinkTypesServer`, `StaffPrivateUrlServer` |
+
+### Business Domain Architecture
+
+```mermaid
+graph TB
+    subgraph "Business Logic Layer"
+        subgraph "Membership Domain"
+            WOI["walletOrderItem<br/>orderPb.ItemsServer"]
+            BSS["benefitServiceServer<br/>pb.BenefitServiceServer"]
+            WICS["walletItemConsumptionServer<br/>pb.MembershipWalletItemConsumptionServiceServer"]
+        end
+        
+        subgraph "Link Management Domain"
+            LTS["Server<br/>links.LinkTypesServer"]
+            SPUS["staffPrivateUrlServer<br/>staffProfile.StaffPrivateUrlServer"]
+        end
+    end
+    
+    subgraph "External Service Dependencies"
+        MEMWALLET["pb.MembershipWalletsClient"]
+        SERVSET["serviceSettingPb.ServiceSettingsClient"]
+        BILLING["billingpb.SubscriptionRecordsClient"]
+        SERVICES["service.ServicesClient"]
+        EMPLOYEES["employee.EmployeesClient"]
+        DYNAMICLINK["dynamicLink.DynamicLinksClient"]
+    end
+    
+    subgraph "Order Processing System"
+        ORDERITEMS["orderPb.ItemsServer Interface"]
+    end
+    
+    WOI --> MEMWALLET
+    WOI --> SERVSET
+    WOI --> BILLING
+    WOI --> ORDERITEMS
+    
+    BSS --> SERVICES
+    WICS --> SERVICES
+    
+    LTS --> SERVICES
+    LTS --> EMPLOYEES
+    
+    SPUS --> DYNAMICLINK
+```
+
+**Sources:** [membership-items/wallet_order_items.go:26-42](), [membership-items/items.go:19-21](), [links/link_types.go:58-69](), [links/staff_private_url.go:12-14]()
+
+## Membership System Business Logic
+
+The membership system handles complex e-commerce operations including subscription billing, tax calculations, payment gateway integration, and lease management for shopping cart operations.
+
+### Wallet Order Item Implementation
+
+The `walletOrderItem` struct serves as the primary business logic handler for membership purchases and subscription management:
+
+```mermaid
+graph LR
+    subgraph "Core Operations"
+        CHARGE["ChargeItem()"]
+        GETPRICE["GetPrice()"]
+        VALIDATE["Validate()"]
+        CONFIRM["ConfirmItem()"]
+    end
+    
+    subgraph "Lease Management"
+        OBTAIN["ObtainLease()"]
+        RELEASE["ReleaseLease()"]
+        CONFIRMLE["ConfirmLease()"]
+    end
+    
+    subgraph "External Integrations"
+        TAXCALC["Tax Calculation<br/>serviceSettingPb"]
+        BILLING["Subscription Creation<br/>billingpb"]
+        WALLETMGMT["Wallet Management<br/>pb.MembershipWalletsClient"]
+        PAYMENT["Payment Processing<br/>billingpb.PaymentMethodsClient"]
+    end
+    
+    CHARGE --> TAXCALC
+    CHARGE --> BILLING
+    CHARGE --> WALLETMGMT
+    CHARGE --> PAYMENT
+    
+    GETPRICE --> TAXCALC
+    VALIDATE --> WALLETMGMT
+    CONFIRM --> WALLETMGMT
+```
+
+**Sources:** [membership-items/wallet_order_items.go:68-168](), [membership-items/wallet_order_items.go:170-257](), [membership-items/wallet_order_items.go:407-435]()
+
+### Subscription and Billing Workflow
+
+The membership system implements sophisticated subscription billing logic with tax calculation and payment gateway integration:
+
+```mermaid
+flowchart TD
+    START["Membership Purchase Request"]
+    GETWALLET["Get Wallet Item<br/>memWalletCli.GetWalletItem()"]
+    CALCPRICE["Calculate Base Price<br/>plan.GetPrice() + plan.GetSetupCost()"]
+    GETTAX["Get Tax Settings<br/>servSettingCli.GetServiceSetting()"]
+    APPLYTAX["Apply Tax Calculation<br/>taxAmount = price * percentage / 100"]
+    VALIDATE["Validate Amount & Currency"]
+    VALIDATEWALLET["Validate Subscription Wallet<br/>membership.ValidateSubscriptionWallet()"]
+    CREATESUBSCRIPTION["Create Subscription Record<br/>subscriptionRecordsCli.CreateSubscriptionRecord()"]
+    UPDATEBILLING["Update Billing in Wallet<br/>memWalletCli.UpdateBillingInWallet()"]
+    RESPONSE["Return Transaction Response"]
+    
+    START --> GETWALLET
+    GETWALLET --> CALCPRICE
+    CALCPRICE --> GETTAX
+    GETTAX --> APPLYTAX
+    APPLYTAX --> VALIDATE
+    VALIDATE --> VALIDATEWALLET
+    VALIDATEWALLET --> UPDATEBILLING
+    UPDATEBILLING --> CREATESUBSCRIPTION
+    CREATESUBSCRIPTION --> RESPONSE
+```
+
+**Sources:** [membership-items/wallet_order_items.go:68-168](), [membership-items/wallet_order_items.go:78-94](), [membership-items/wallet_order_items.go:141-167]()
+
+### Benefit and Consumption Validation
+
+The system validates membership benefits and consumption patterns through service-based validation:
+
+| Operation | Purpose | Implementation |
+|-----------|---------|----------------|
+| **Benefit Validation** | Validates service IDs against membership benefits using glob patterns | `benefitServiceServer.BatchGetBenefit()` |
+| **Consumption Tracking** | Validates membership item consumption against service durations | `walletItemConsumptionServer.GetMembershipWalletItemConsumption()` |
+| **Duration Matching** | Ensures consumed service duration matches available service durations | Service duration validation in consumption logic |
+
+**Sources:** [membership-items/items.go:28-80](), [membership-items/items.go:133-203](), [membership-items/items.go:175-200]()
+
+## Link Management Business Logic
+
+The link management system handles validation of relationships between business entities and provides staff workflow automation tools.
+
+### Entity Relationship Validation
+
+The `Server` struct implements comprehensive validation for different types of business entity relationships:
+
+```mermaid
+graph TD
+    subgraph "Link Types"
+        SRT["SERVICE_RESOURCE_TYPE"]
+        SE["SERVICE_EMPLOYEE"]
+        SC["SERVICE_CHANNEL"]
+        SR["SERVICE_RESOURCE"]
+        SA["SERVICE_ADDON"]
+        AE["AREACODE_EMPLOYEE"]
+        LE["LOCATION_EMPLOYEE"]
+    end
+    
+    subgraph "Validation Process"
+        EXTRACT["Extract Resource IDs<br/>by Link Type"]
+        BATCH["Batch Validation<br/>per Resource Type"]
+        VALIDATE["Validate Existence<br/>via gRPC Clients"]
+        RULES["Apply Business Rules<br/>e.g., Non-identifiable Resources"]
+    end
+    
+    subgraph "Resource Clients"
+        SERVICECLI["service.ServicesClient"]
+        RESCLI["resource.ResourcesClient"]
+        EMPCLI["employee.EmployeesClient"]
+        CHANCLI["channel.ChannelsClient"]
+        ADDONCLI["addon.AddonsClient"]
+    end
+    
+    SRT --> EXTRACT
+    SE --> EXTRACT
+    SC --> EXTRACT
+    SR --> EXTRACT
+    SA --> EXTRACT
+    AE --> EXTRACT
+    LE --> EXTRACT
+    
+    EXTRACT --> BATCH
+    BATCH --> VALIDATE
+    VALIDATE --> RULES
+    
+    VALIDATE --> SERVICECLI
+    VALIDATE --> RESCLI
+    VALIDATE --> EMPCLI
+    VALIDATE --> CHANCLI
+    VALIDATE --> ADDONCLI
+```
+
+**Sources:** [links/link_types.go:32-39](), [links/link_types.go:78-307](), [links/link_types.go:172-304]()
+
+### Link Type Business Rules
+
+The system enforces specific business rules for different entity relationship types:
+
+| Link Type | First Resource | Second Resource | Business Rule |
+|-----------|----------------|-----------------|---------------|
+| `SERVICE_RESOURCE_TYPE` | Service | Resource Type | Only non-identifiable resource types allowed |
+| `SERVICE_EMPLOYEE` | Service | Employee | Employee must exist and be valid |
+| `SERVICE_CHANNEL` | Service | Channel | Channel must be active |
+| `SERVICE_RESOURCE` | Service | Resource | Resource must be available |
+| `AREACODE_EMPLOYEE` | Area Code | Employee | Geographic assignment validation |
+
+**Sources:** [links/link_types.go:25-30](), [links/link_types.go:100-169](), [links/link_types.go:204-206]()
+
+### Staff Private URL Generation
+
+The system provides dynamic URL generation for staff appointment booking workflows:
+
+```mermaid
+flowchart LR
+    REQUEST["GeneratePrivateUrlRequest<br/>with EmployeeId"]
+    MARSHAL["Marshal Appointment Settings<br/>ptypes.MarshalAny()"]
+    CREATE["Create Dynamic Link<br/>dynamicCli.CreateDynamicLink()"]
+    RESPONSE["Return Private URL GUID"]
+    
+    REQUEST --> MARSHAL
+    MARSHAL --> CREATE
+    CREATE --> RESPONSE
+    
+    subgraph "Dynamic Link Settings"
+        STAFF["StaffId: in.EmployeeId"]
+        SINGLE["IsSingleUse: true"]
+        PARENT["Parent: idutil.GetParent()"]
+    end
+    
+    MARSHAL --> STAFF
+    MARSHAL --> SINGLE
+    CREATE --> PARENT
+```
+
+**Sources:** [links/staff_private_url.go:25-47](), [links/staff_private_url.go:27-32](), [links/staff_private_url.go:35-44]()
+
+## Service Integration Patterns
+
+The business logic components follow consistent patterns for external service integration and dependency injection:
+
+### Dependency Injection Configuration
+
+Both business domains use FX modules for dependency injection with grouped service registrations:
+
+| Component | Registration Pattern | Purpose |
+|-----------|---------------------|---------|
+| **Order Items** | `fx.Out` with `group:"order-items"` | Pluggable order processing |
+| **gRPC Services** | `fx.Annotated` with `group:"grpc-service"` | Service registration |
+| **GraphQL Operations** | `fx.Annotated` with `group:"graphql-service"` | Schema registration |
+| **HTTP Handlers** | `fx.Annotated` with `group:"http-service"` | Route registration |
+
+**Sources:** [membership-items/fx.go:8-18](), [links/fx.go:53-65](), [membership-items/wallet_order_items.go:26-29]()
+
+### Error Handling and Validation
+
+The business logic implements comprehensive error handling with gRPC status codes:
+
+```mermaid
+graph LR
+    subgraph "Validation Patterns"
+        INPUT["Input Validation<br/>in.Validate()"]
+        BUSINESS["Business Rule Validation"]
+        EXTERNAL["External Service Validation"]
+    end
+    
+    subgraph "Error Types"
+        INVALID["codes.InvalidArgument"]
+        FAILED["codes.FailedPrecondition"]
+        NOTFOUND["codes.NotFound"]
+    end
+    
+    INPUT --> INVALID
+    BUSINESS --> FAILED
+    EXTERNAL --> NOTFOUND
+    
+    subgraph "Response Patterns"
+        EARLY["Early Return on Validation"]
+        STATUS["status.Error() with Message"]
+        EMPTY["empty.Empty{} for Success"]
+    end
+```
+
+**Sources:** [membership-items/wallet_order_items.go:408-410](), [links/link_types.go:310-312](), [membership-items/items.go:30-32]()

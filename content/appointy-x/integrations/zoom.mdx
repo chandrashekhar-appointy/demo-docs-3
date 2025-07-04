@@ -1,0 +1,277 @@
+\*\*
+\*\*---
+title: Zoom Integration - Appointy X
+description: Comprehensive guide for Zoom integration in Appointy X, including setup, implementation, and security considerations
+
+---
+
+# Zoom Integration in AppointyX
+
+## Table of Contents
+
+- [Purpose of Integration](#purpose-of-integration)
+- [Core Technology: Zoom API and Authentication](#core-technology-zoom-api-and-authentication)
+- [Environment-Specific Configurations](#environment-specific-configurations)
+- [Project Structure & Onboarding](#project-structure--onboarding)
+- [Technical Implementation](#technical-implementation)
+- [Key Considerations & Configuration Notes](#key-considerations--configuration-notes)
+- [Credential Management](#credential-management)
+- [API Implementation Details](#api-implementation-details)
+
+## Purpose of Integration
+
+AppointyX integrates with Zoom to provide users the capability to automatically generate and manage Zoom meeting links for virtual services and appointments. This offers a dedicated video conferencing option alongside other potential integrations like Google Meet.
+
+## Core Technology: Zoom API and Authentication
+
+The integration leverages Zoom's APIs, primarily utilizing the "General App" type.
+
+- **General App (OAuth 2.0)**: This app type allows AppointyX to perform actions (e.g., create a meeting) on behalf of an authorized AppointyX user (staff member) using the OAuth 2.0 protocol. This is crucial for ensuring meetings are associated with the correct host.
+- Typically, "General Apps" intended for widespread use must be published on the Zoom Marketplace, which involves a review and verification process by Zoom.
+- Other Zoom app types like "Server-to-Server OAuth" (actions on behalf of the AppointyX application itself, not a user) and "Webhook Only" (for receiving notifications) are not the primary models for our core meeting creation functionality.
+
+## Environment-Specific Configurations
+
+### Production Environment
+
+- **App Type**: Utilizes a \*\*[published "General App"](https://marketplace.zoom.us/apps/69Uj2wsvQZOuuRpCFNljiA) on the Zoom Marketplace.
+- **Authentication**: Employs a standard OAuth 2.0 flow, allowing AppointyX staff users to authorize the application to manage Zoom meetings on their behalf.
+- **Credential Source**: Uses a set of production-grade application credentials (Client ID, Client Secret) configured for the AppointyX platform.
+- **Capability**: Supports the creation of Zoom meetings for scheduled appointments linked to authenticated staff members.
+
+### Development (Dev) & Quality Assurance (QA) Environments
+
+- **App Type**: Currently utilizes an unpublished "General App".
+- **Authentication & Setup**:
+  - This app is presently configured using credentials (Client ID, Client Secret) associated with an individual developer's Zoom account.
+  - This setup was implemented as an interim measure for initial development and local testing by that specific developer.
+  - Due to Zoom's restrictions, testing is limited to localhost only as redirect URIs cannot be configured for other environments.
+- **Current Limitations & Implications for Dev/QA**:
+  - Non-Representative OAuth Flow: This configuration does not fully replicate the production OAuth 2.0 flow where various team members or test user accounts can independently authorize and use the Zoom integration.
+  - Restricted Testing: Testing the Zoom integration comprehensively on deployed Dev or QA environments by the broader team is challenging.
+  - Debugging Constraints: The inability for multiple testers to easily use the integration with different Zoom accounts in Dev/QA environments complicates thorough debugging.
+  - Environment Limitation: Due to Zoom's OAuth restrictions for unpublished apps, testing can only be done on localhost.
+
+## Technical Implementation
+
+### Core Components
+
+#### Integration Server ([integration/zoom.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/integration/zoom.go))
+
+- Handles OAuth 2.0 authentication flow
+- Manages token refresh and revocation
+- Implements user connection and metadata management
+- Base URL: https://api.zoom.us/v2
+
+#### Controller ([zoom/controller.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/controller.go))
+
+- Manages meeting creation, updates, and deletion
+- Handles Zoom settings and configurations
+- Implements meeting event management
+- Provides user and calendar linking functionality
+
+### Key Features
+
+#### Meeting Management ([core.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/core.go))
+
+```go
+type SettingObject struct {
+    HostVideo        bool
+    ParticipantVideo bool
+    JoinBeforeHost   bool
+    MuteUponEntry    bool
+    WaitingRoom      bool
+    // ... other settings
+}
+```
+
+#### OAuth Flow Implementation ([integration/zoom.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/integration/zoom.go))
+
+```go
+func (z *zoom) Connected(ctx context.Context, in *intPb.ConnectedRequest) (*intPb.IntegrationToken, error) {
+    // Handles OAuth code exchange
+    // Retrieves user information
+    // Stores integration tokens
+}
+```
+
+#### Token Management
+
+- Access tokens expire in 1 hour (refreshed after 50 minutes)
+- Refresh tokens expire in 15 years
+- Automatic token refresh mechanism
+
+## Key Considerations & Configuration Notes
+
+- The primary difference in Zoom integration between Production and non-production (Dev/QA) environments lies in the nature and scope of the "General App" configuration and its associated OAuth flow.
+- The current Dev/QA setup is a known constraint that impacts the breadth and depth of pre-production testing for Zoom-related features.
+- Strategies are being evaluated to establish a more robust and representative Zoom "General App" configuration for Dev and QA environments.
+
+## Credential Management
+
+- For information regarding the specific Zoom application credentials (Client ID, Client Secret) used in any environment, please coordinate with Infra-Team.
+- For Dev/QA environment credentials and access, contact Vibhu directly at vibhu@appointy.com.
+
+## Project Structure & Onboarding
+
+### Repository Location
+
+The Zoom integration codebase can be found at:
+
+- Repository URL: [gitlab.com/appointy/waqt/meetings](https://gitlab.com/appointy/waqt/meetings)
+
+Main implementation files:
+
+- [`integration/zoom.go`](https://gitlab.com/appointy/waqt/meetings/-/blob/master/integration/zoom.go) - OAuth and API integration
+- [`zoom/controller.go`](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/controller.go) - Meeting management
+- [`zoom/log.go`](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/log.go) - Logging implementation
+
+### Project Structure
+
+```
+meetings/
+├── core.go                 # Core service initialization
+├── event.go               # Event handling
+├── meeting.go             # Meeting functionality
+├── fx.go                  # Dependency injection
+│
+├── helper/                # Utility functions
+│   ├── log-error.go      # Error logging
+│   └── validate.go       # Input validation
+│
+├── integration/           # External integrations
+│   └── zoom.go           # Zoom OAuth & API
+│
+├── logErrorInternal/      # Error logging
+│   ├── fx.go             # DI setup
+│   ├── log-error.go      # Implementation
+│   └── log-error_test.go # Tests
+│
+├── pb/                    # Protocol Buffers
+│   ├── calendar-event*.go # Calendar events
+│   ├── meetings*.go       # Meeting service
+│   ├── zoom_controller*.go# Zoom controller
+│   └── *.proto           # Proto definitions
+│
+├── zoom/                  # Zoom implementation
+│   ├── controller.go      # Main controller
+│   └── log.go            # Logging
+│
+└── README.md             # Documentation
+```
+
+### Prerequisites
+
+```bash
+# Required Go version
+go version go1.16 or higher
+
+# Required tools
+protoc          # Protocol buffer compiler
+protoc-gen-go   # Go code generator for protocol buffers
+```
+
+### Environment Setup
+
+1. Request access to Dev/QA Zoom credentials from vibhu@appointy.com
+2. Set up requires updating the following variables for zoom in info.json file:
+
+```json
+{
+  "itype": 10,
+  "name": "ZOOM",
+  "client_id": "<client_id>",
+  "client_secret": "<client_secret>",
+  "redirect_uri": "<redirect_uri>"
+}
+```
+
+### Local Development
+
+```bash
+# Install dependencies
+go mod download
+
+# Generate protocol buffer code
+make proto
+
+# Run tests
+go test ./...
+```
+
+## API Implementation Details
+
+### Meeting Creation ([zoom/controller.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/controller.go))
+
+```go
+func (s *Core) AddMeetingEvent(ctx context.Context, in *pb.AddMeetingEventRequest) (*pb.MeetingEvent, error) {
+    // Validates request
+    // Retrieves Zoom settings
+    // Creates meeting with specified configuration
+    // Returns meeting event with join URL
+}
+```
+
+### Meeting Updates ([zoom/controller.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/controller.go))
+
+```go
+func (s *Core) UpdateMeetingEvent(ctx context.Context, in *pb.UpdateMeetingEventRequest) (*pb.MeetingEvent, error) {
+    // Updates existing meeting
+    // Handles time/settings changes
+    // Returns updated meeting event
+}
+```
+
+### User Management ([zoom/controller.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/controller.go))
+
+```go
+func (s *Core) ListZoomUsers(ctx context.Context, in *pb.ListZoomUsersRequest) (*pb.ListZoomUsersResponse, error) {
+    // Retrieves connected Zoom users
+    // Handles pagination
+    // Returns user list with metadata
+}
+```
+
+### Settings Management ([zoom/controller.go](https://gitlab.com/appointy/waqt/meetings/-/blob/master/zoom/controller.go))
+
+```go
+func DefaultZoomSetting() *pb.ZoomSetting {
+    return &pb.ZoomSetting{
+        HostVideo:        true,
+        ParticipantVideo: true,
+        JoinBeforeHost:   false,
+        MuteUponEntry:    true,
+        WaitingRoom:      true,
+        // ... other default settings
+    }
+}
+```
+
+### Error Handling
+
+The integration implements comprehensive error handling and logging:
+
+- OAuth errors
+- API rate limits
+- Token expiration/refresh failures
+- Meeting creation/update failures
+
+### Security Considerations
+
+#### Token Storage
+
+- Access tokens are stored securely
+- Refresh tokens are encrypted
+- Token rotation is automated
+
+#### User Authentication
+
+- OAuth 2.0 flow for user authorization
+- Scope-based access control
+- Meeting authentication options
+
+#### Meeting Security
+
+- Configurable waiting rooms
+- Meeting password support
+- Host controls and restrictions

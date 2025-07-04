@@ -1,0 +1,271 @@
+# gRPC Services
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [grpc.go](grpc.go)
+- [membership-items/fx.go](membership-items/fx.go)
+- [membership-items/items.go](membership-items/items.go)
+- [rate-limiter.go](rate-limiter.go)
+- [redis/redis.go](redis/redis.go)
+- [router.go](router.go)
+
+</details>
+
+
+
+This document covers the gRPC service layer implementation within the waqt-deployment service, including service registration, interceptor chains, and communication patterns with external microservices. The deployment service acts as a central orchestrator that communicates with numerous backend services via gRPC protocols.
+
+For information about HTTP routing and middleware, see [HTTP Endpoints](#4.3). For GraphQL API implementation details, see [GraphQL API](#4.1).
+
+## Service Architecture Overview
+
+The gRPC services in waqt-deployment follow a hub-and-spoke architecture where the deployment service acts as a central orchestrator communicating with distributed microservices across two primary domains: waqt business services and saastack.io platform services.
+
+```mermaid
+graph TB
+    subgraph "waqt-deployment (Central Hub)"
+        GRPC_SERVER["grpc.Server"]
+        INTERCEPTORS["Interceptor Chain"]
+        SERVICE_REGISTRY["Service Registry<br/>fx.Group: grpc-service"]
+    end
+    
+    subgraph "Local gRPC Services"
+        BENEFIT_SVC["benefitServiceServer<br/>pb.BenefitServiceServer"]
+        WALLET_SVC["walletItemConsumptionServer<br/>pb.MembershipWalletItemConsumptionServiceServer"]
+        BUYER_SVC["MembershipBuyerServiceServer"]
+    end
+    
+    subgraph "External waqt Services"
+        APPT_CLIENT["appointmentpb.AppointmentClient"]
+        SERVICE_CLIENT["servicepb.ServicesClient"]
+        RESOURCE_CLIENT["resourcepb.ResourceClient"]
+        CALENDAR_CLIENT["calendarpb.CalendarClient"]
+    end
+    
+    subgraph "External saastack Services"
+        USER_CLIENT["userpb.UserProfilesClient"]
+        COMPANY_CLIENT["companypb.CompanyClient"]
+        BILLING_CLIENT["billingpb.BillingClient"]
+        API_KEY_CLIENT["apiKeypb.ApiKeysClient"]
+        NOTIFICATION_CLIENT["notificationpb.NotificationClient"]
+    end
+    
+    GRPC_SERVER --> INTERCEPTORS
+    INTERCEPTORS --> SERVICE_REGISTRY
+    SERVICE_REGISTRY --> BENEFIT_SVC
+    SERVICE_REGISTRY --> WALLET_SVC
+    SERVICE_REGISTRY --> BUYER_SVC
+    
+    BENEFIT_SVC -.->|"gRPC Calls"| SERVICE_CLIENT
+    WALLET_SVC -.->|"gRPC Calls"| SERVICE_CLIENT
+    
+    GRPC_SERVER -.->|"Outbound Calls"| APPT_CLIENT
+    GRPC_SERVER -.->|"Outbound Calls"| USER_CLIENT
+    GRPC_SERVER -.->|"Outbound Calls"| COMPANY_CLIENT
+    GRPC_SERVER -.->|"Outbound Calls"| BILLING_CLIENT
+    GRPC_SERVER -.->|"Outbound Calls"| API_KEY_CLIENT
+```
+
+**Sources:** [router.go:388-406](), [grpc.go:9-26](), [membership-items/items.go:19-86]()
+
+## Service Registration and Discovery
+
+The gRPC service registration uses Uber's fx dependency injection framework with a group-based registration pattern. Services are automatically discovered and registered through the `grpc-service` group tag.
+
+```mermaid
+graph LR
+    subgraph "Service Registration Flow"
+        FX_MODULE["fx.Module"]
+        GRPC_GROUP["fx.Group: grpc-service"]
+        REGISTER_FUNC["RegisterGrpcServicesIn"]
+        GRPC_SERVER["grpc.Server"]
+    end
+    
+    subgraph "Service Providers"
+        BENEFIT_PROVIDER["NewBenefitServiceServer"]
+        WALLET_PROVIDER["NewMembershipWalletItemConsumptionServiceServer"]
+        BUYER_PROVIDER["NewMembershipBuyerServiceServer"]
+    end
+    
+    subgraph "Service Instances"
+        BENEFIT_IMPL["benefitServiceServer"]
+        WALLET_IMPL["walletItemConsumptionServer"]
+        BUYER_IMPL["membershipBuyerServiceServer"]
+    end
+    
+    FX_MODULE --> BENEFIT_PROVIDER
+    FX_MODULE --> WALLET_PROVIDER
+    FX_MODULE --> BUYER_PROVIDER
+    
+    BENEFIT_PROVIDER --> BENEFIT_IMPL
+    WALLET_PROVIDER --> WALLET_IMPL
+    BUYER_PROVIDER --> BUYER_IMPL
+    
+    BENEFIT_IMPL --> GRPC_GROUP
+    WALLET_IMPL --> GRPC_GROUP
+    BUYER_IMPL --> GRPC_GROUP
+    
+    GRPC_GROUP --> REGISTER_FUNC
+    REGISTER_FUNC --> GRPC_SERVER
+```
+
+**Sources:** [grpc.go:17-26](), [membership-items/fx.go:8-18]()
+
+The registration process is controlled by the `ExposureConfig.Grpc` flag and executed through the `InvokeGrpcServices` fx.Invoke function:
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `RegisterGrpcServicesIn` | Struct | Dependency injection container for gRPC registration |
+| `GrpcRegister` | `[]func(s *grpc.Server)` | Collection of service registration functions |
+| `fx.Group:"grpc-service"` | Tag | Groups all gRPC service providers for batch registration |
+
+**Sources:** [grpc.go:9-15]()
+
+## Interceptor Chain
+
+The gRPC interceptor chain provides cross-cutting concerns including authentication, logging, recovery, and request context management. The interceptors are applied in a specific order to ensure proper request processing.
+
+```mermaid
+graph TD
+    REQUEST["Incoming gRPC Request"]
+    
+    subgraph "Interceptor Chain"
+        RECOVERY["grpcrecovery.UnaryServerInterceptor<br/>Panic Recovery"]
+        JWT["JWT Interceptor<br/>Token Validation"]
+        WRAPPER["GrpcWrapper<br/>Rights Bypass Check"]
+        USER_INFO["auth.UserInfoFromJwtUnaryInterceptor<br/>User Context Creation"]
+        CLIENT_IP["ClientIpInterceptor<br/>IP Address Extraction"]
+        VERSION["version.Interceptor<br/>Version Header"]
+        LOGGER["LogInterceptor<br/>Request Logging"]
+        GRPC_CALL["IdentifyGrpcCall<br/>Request Type Marking"]
+    end
+    
+    HANDLER["gRPC Handler Method"]
+    RESPONSE["Response"]
+    
+    REQUEST --> RECOVERY
+    RECOVERY --> JWT
+    JWT --> WRAPPER
+    WRAPPER --> USER_INFO
+    USER_INFO --> CLIENT_IP
+    CLIENT_IP --> VERSION
+    VERSION --> LOGGER
+    LOGGER --> GRPC_CALL
+    GRPC_CALL --> HANDLER
+    HANDLER --> RESPONSE
+```
+
+**Sources:** [router.go:395-405]()
+
+### Key Interceptor Functions
+
+| Interceptor | Function | Purpose |
+|-------------|----------|---------|
+| `ClientIpInterceptor` | Extracts client IP from peer context | IP-based logging and rate limiting |
+| `IdentifyGrpcCall` | Marks request as gRPC call | Request type identification for middleware |
+| `grpcWrapper.GrpcMethodSkipMiddleware` | Bypasses rights checking for specific calls | Service-to-service communication optimization |
+
+**Sources:** [router.go:375-406]()
+
+## Service Implementation Pattern
+
+Local gRPC services follow a consistent implementation pattern with dependency injection for external service clients. Here's the pattern demonstrated by the membership services:
+
+```mermaid
+graph LR
+    subgraph "Service Structure"
+        INTERFACE["pb.BenefitServiceServer<br/>gRPC Interface"]
+        IMPL["benefitServiceServer<br/>Implementation Struct"]
+        METHODS["BatchGetBenefit<br/>GetBenefit<br/>Service Methods"]
+    end
+    
+    subgraph "Dependencies"
+        CLIENT["servicepb.ServicesClient<br/>External Service Client"]
+        VALIDATION["Request Validation"]
+        ERROR_HANDLING["Status Error Handling"]
+    end
+    
+    subgraph "Business Logic"
+        GLOB_PARSING["Glob Pattern Parsing"]
+        PREFIX_CHECKING["ID Prefix Validation"]
+        BATCH_PROCESSING["Batch Service Calls"]
+    end
+    
+    INTERFACE --> IMPL
+    IMPL --> METHODS
+    METHODS --> CLIENT
+    METHODS --> VALIDATION
+    METHODS --> ERROR_HANDLING
+    
+    METHODS --> GLOB_PARSING
+    METHODS --> PREFIX_CHECKING
+    METHODS --> BATCH_PROCESSING
+```
+
+**Sources:** [membership-items/items.go:19-86](), [membership-items/items.go:123-202]()
+
+### Service Method Example
+
+The `BatchGetBenefit` method demonstrates the typical service implementation pattern:
+
+1. **Request Validation**: Uses protobuf validation with `in.Validate()`
+2. **ID Processing**: Handles both glob patterns and direct IDs
+3. **Prefix-based Routing**: Routes requests based on ID prefixes
+4. **Batch Operations**: Optimizes external service calls through batching
+5. **Error Handling**: Returns structured gRPC status errors
+
+**Sources:** [membership-items/items.go:28-80]()
+
+## Client Configuration and Communication
+
+The deployment service maintains gRPC clients for communication with external services. These clients are configured through dependency injection and used across service implementations.
+
+| Service Domain | Client Types | Purpose |
+|----------------|--------------|---------|
+| waqt Services | `servicepb.ServicesClient`, `appointmentpb.AppointmentClient` | Business domain operations |
+| saastack Services | `userpb.UserProfilesClient`, `apiKeypb.ApiKeysClient` | Platform services |
+| Local Services | `pb.LocalBenefitServiceClient` | Internal service communication |
+
+**Sources:** [membership-items/fx.go:10-17](), [membership-items/items.go:20-21]()
+
+The service clients support advanced features including:
+
+- **Field Masking**: Selective field retrieval using `field_mask.FieldMask`
+- **Batch Operations**: Optimized bulk operations like `BatchGetService`
+- **Error Propagation**: Structured error handling with gRPC status codes
+- **Context Propagation**: Request context and metadata forwarding
+
+**Sources:** [membership-items/items.go:67-77](), [membership-items/items.go:158-165]()
+
+## Service Lifecycle Management
+
+gRPC services are managed through the fx lifecycle system, ensuring proper startup and shutdown coordination:
+
+```mermaid
+graph TD
+    subgraph "Lifecycle Management"
+        START["Application Start"]
+        CONFIG_CHECK["ExposureConfig.Grpc Check"]
+        SERVICE_REG["Service Registration Loop"]
+        SERVER_START["gRPC Server Start"]
+        
+        SHUTDOWN["Application Shutdown"]
+        SERVER_STOP["gRPC Server Stop"]
+    end
+    
+    START --> CONFIG_CHECK
+    CONFIG_CHECK -->|"true"| SERVICE_REG
+    CONFIG_CHECK -->|"false"| SERVER_START
+    SERVICE_REG --> SERVER_START
+    
+    SHUTDOWN --> SERVER_STOP
+```
+
+**Sources:** [grpc.go:18-25]()
+
+The conditional registration allows for flexible deployment configurations where gRPC services can be enabled or disabled based on the `ExposureConfig.Grpc` setting, supporting different deployment scenarios and service boundaries.
+
+**Sources:** [grpc.go:19]()

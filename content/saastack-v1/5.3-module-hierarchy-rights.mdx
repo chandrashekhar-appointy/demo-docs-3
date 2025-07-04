@@ -1,0 +1,293 @@
+# Module Hierarchy & Rights
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [Dockerfile](Dockerfile)
+- [displayModuleRoles.json](displayModuleRoles.json)
+- [module_parents.json](module_parents.json)
+
+</details>
+
+
+
+This document covers the hierarchical role-based access control (RBAC) system that governs module access permissions throughout the waqt platform. The system defines parent-child relationships between modules, organizational access scopes, and role inheritance patterns to enforce fine-grained access control.
+
+For authentication mechanisms and token validation, see [Authentication Middleware](#5.2). For general RBAC implementation details, see [Role-Based Access Control](#5.1).
+
+## Purpose and Scope
+
+The Module Hierarchy & Rights system establishes a multi-dimensional access control framework that operates across two primary hierarchies:
+
+1. **Module Hierarchy**: Parent-child relationships between business modules (e.g., Services → Service Templates → Service Settings)
+2. **Organizational Hierarchy**: Nested access scopes from group level down to individual users (grp → com → loc → emp → usr)
+
+This system enables administrators to grant permissions that automatically cascade through hierarchical relationships while maintaining isolation between organizational boundaries.
+
+## Organizational Access Levels
+
+The system defines five distinct organizational access levels that determine the scope of a user's permissions:
+
+### Access Level Hierarchy
+
+```mermaid
+graph TD
+    subgraph "Organizational Hierarchy"
+        GRP["grp<br/>Group Level<br/>Cross-company access"]
+        COM["com<br/>Company Level<br/>All locations in company"]
+        LOC["loc<br/>Location Level<br/>Single location access"]
+        EMP["emp<br/>Employee Level<br/>Assigned employees only"]
+        USR["usr<br/>User Level<br/>Personal access only"]
+    end
+    
+    GRP --> COM
+    COM --> LOC
+    LOC --> EMP
+    EMP --> USR
+    
+    subgraph "Access Scope Examples"
+        ALL_SCOPE["all - No organizational restriction"]
+        COM_SCOPE["com - Company-wide permissions"]
+        LOC_SCOPE["loc - Location-specific permissions"]
+        EMP_SCOPE["emp - Employee-specific permissions"]
+        USR_SCOPE["usr - User-specific permissions"]
+    end
+```
+
+**Sources:** [module_parents.json:1-471](), [displayModuleRoles.json:34](), [displayModuleRoles.json:124]()
+
+### Access Level Definitions
+
+| Level | Code | Scope | Example Use Case |
+|-------|------|-------|------------------|
+| All | `all` | No organizational restrictions | System-wide appointments access |
+| Company | `com` | All locations within a company | Company-wide resource management |
+| Location | `loc` | Single location only | Location-specific reviews |
+| Employee | `emp` | Assigned employees only | Personal schedule management |
+| User | `usr` | Individual user access | Personal profile settings |
+
+## Module Parent Relationships
+
+The system supports complex module hierarchies where business modules can inherit access patterns from their parents. This enables logical grouping of related functionality under broader access categories.
+
+### Module Hierarchy Structure
+
+```mermaid
+graph TD
+    subgraph "Core Business Modules"
+        APPOINTMENTS["Appointments<br/>grp,com,loc"]
+        SERVICES["Services<br/>grp,com,loc"]
+        CUSTOMERS["Customers<br/>grp,com,loc"]
+        EMPLOYEES["Employees<br/>grp,com"]
+    end
+    
+    subgraph "Service-Related Modules"
+        SERVICE_PRICES["ServicePrices<br/>grp,com,loc"]
+        SERVICE_SETTINGS["ServiceSettings<br/>grp,com,loc"]
+        SERVICE_TEMPLATES["ServiceTemplates<br/>grp,com,loc"]
+    end
+    
+    subgraph "Resource Management"
+        RESOURCES["Resources<br/>grp,com,loc"]
+        RESOURCE_TYPES["ResourceTypes<br/>grp,com,loc"]
+    end
+    
+    subgraph "Time Management"
+        OPEN_HOURS["OpenHours<br/>grp,com,loc"]
+        BLOCK_HOURS["BlockHours<br/>grp,com,loc"]
+    end
+    
+    SERVICES --> SERVICE_PRICES
+    SERVICES --> SERVICE_SETTINGS
+    SERVICES --> SERVICE_TEMPLATES
+    
+    RESOURCES --> RESOURCE_TYPES
+    
+    APPOINTMENTS --> OPEN_HOURS
+    APPOINTMENTS --> BLOCK_HOURS
+```
+
+**Sources:** [module_parents.json:2-470]()
+
+### Parent-Child Configuration
+
+The `module_parents.json` file defines which organizational levels each module supports:
+
+```json
+{
+  "module_name": "Appointments",
+  "parents": ["grp", "com", "loc"]
+}
+```
+
+This configuration indicates that the Appointments module can be accessed at group, company, and location levels, but not at employee or user levels.
+
+## Role Hierarchy and Inheritance
+
+Display module roles establish a hierarchical permission structure where child roles inherit capabilities from their parents while potentially adding restrictions or specific access patterns.
+
+### Role Inheritance Pattern
+
+```mermaid
+graph TD
+    subgraph "Appointments Module Hierarchy"
+        APPT_FULL["dmr_01E9ZEDJ3WCX34NXRK03YZVJQW<br/>Full access to appointments<br/>Priority: 1, Parent: none"]
+        APPT_VIEW_SETTINGS["dmr_01FS6J2FZGT5WDQ7DYFD8HBK4G<br/>Full access + view settings<br/>Priority: 2"]
+        APPT_VIEW_ONLY["dmr_01F6HDMT4P2VXWC0W08E69SWJY<br/>View access to appointments<br/>Priority: 3"]
+    end
+    
+    subgraph "Services Module Hierarchy"
+        SERVICES_FULL["dmr_01E9ZEDJ3XQESG12PPVJ8X4YFR<br/>Full access to services<br/>Priority: 1, Parent: none"]
+        SERVICES_CREATE["dmr_01E9ZEDJ3XQESG12PPVJAVTS77<br/>Can create services<br/>Priority: 2"]
+        SERVICES_VIEW["dmr_01E9ZEDJ3XCFY07KCCABXXXMVG<br/>Can view services<br/>Priority: 3"]
+        SERVICES_SETTINGS["dmr_01E9ZEDJ3XCFY07KCCABYXMMVG<br/>Can edit service settings<br/>Priority: 4"]
+    end
+    
+    APPT_FULL --> APPT_VIEW_SETTINGS
+    APPT_VIEW_SETTINGS --> APPT_VIEW_ONLY
+    
+    SERVICES_FULL --> SERVICES_CREATE
+    SERVICES_CREATE --> SERVICES_VIEW
+    SERVICES_FULL --> SERVICES_SETTINGS
+```
+
+**Sources:** [displayModuleRoles.json:3-100](), [displayModuleRoles.json:316-434]()
+
+### Role Priority System
+
+The priority system determines role precedence when multiple roles apply to the same user:
+
+- **Priority 1**: Full administrative access (root level)
+- **Priority 2-3**: Operational access with specific restrictions
+- **Priority 4+**: Specialized or view-only access
+
+Lower priority numbers indicate higher precedence. When a user has multiple roles for the same module, the system applies the role with the lowest priority number.
+
+## Module Role Composition
+
+Each display module role contains specific module roles that grant granular permissions across different system components.
+
+### Role Composition Examples
+
+```mermaid
+graph LR
+    subgraph "Full Appointments Access"
+        FULL_APPT["dmr_01E9ZEDJ3WCX34NXRK03YZVJQW"]
+        
+        subgraph "Module Roles Included"
+            APPT_ADMIN["AppointmentsAdmin"]
+            SERVICE_SETTINGS["ServiceSettingsAdmin"]
+            EMPLOYEE_SETTINGS["EmployeeSettingsAdmin"]
+            ORDERS_ADMIN["OrdersAdmin"]
+            PAYMENTS_ADMIN["PaymentsManagerAdmin"]
+        end
+    end
+    
+    subgraph "View Appointments Only"
+        VIEW_APPT["dmr_01F6HDMT4P2VXWC0W08E69SWJY"]
+        
+        subgraph "Limited Module Roles"
+            APPT_VIEWER["AppointmentsViewer"]
+            SERVICE_VIEWER["ServiceSettingsViewer"]
+            EMPLOYEE_VIEWER["EmployeeSettingsViewer"]
+            ORDERS_VIEWER["OrdersViewer"]
+        end
+    end
+    
+    FULL_APPT --> APPT_ADMIN
+    FULL_APPT --> SERVICE_SETTINGS
+    FULL_APPT --> EMPLOYEE_SETTINGS
+    FULL_APPT --> ORDERS_ADMIN
+    FULL_APPT --> PAYMENTS_ADMIN
+    
+    VIEW_APPT --> APPT_VIEWER
+    VIEW_APPT --> SERVICE_VIEWER
+    VIEW_APPT --> EMPLOYEE_VIEWER
+    VIEW_APPT --> ORDERS_VIEWER
+```
+
+**Sources:** [displayModuleRoles.json:8-31](), [displayModuleRoles.json:75-96]()
+
+## Configuration File Structure
+
+The system relies on two primary configuration files that define the module hierarchy and role relationships:
+
+### displayModuleRoles.json Structure
+
+```json
+{
+  "Id": "dmr_01E9ZEDJ3WCX34NXRK03YZVJQW",
+  "App_name": "Appointments",
+  "Description": "Full access to all appointments, appointment's settings and appointment custom status.",
+  "Name": "Full access to appointments",
+  "Module_roles": [
+    "AppointmentsAdmin",
+    "ServiceSettingsAdmin",
+    "EmployeeSettingsAdmin"
+  ],
+  "Priority": 1,
+  "Parent": "",
+  "Level": "all"
+}
+```
+
+### Key Configuration Fields
+
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `Id` | Unique identifier for the display module role | `dmr_01E9ZEDJ3WCX34NXRK03YZVJQW` |
+| `App_name` | Business module name | `Appointments` |
+| `Module_roles` | Array of specific permission roles | `["AppointmentsAdmin", "ServicesViewer"]` |
+| `Parent` | Parent role ID for inheritance | `dmr_01E9ZEDJ3WCX34NXRK03YZVJQW` |
+| `Level` | Organizational access scope | `all`, `com`, `loc`, `emp`, `usr` |
+| `Priority` | Precedence order (lower = higher precedence) | `1`, `2`, `3` |
+
+**Sources:** [displayModuleRoles.json:3-35](), [Dockerfile:20]()
+
+### module_parents.json Structure
+
+This file defines which organizational levels each module supports:
+
+```json
+{
+  "parents": [
+    {
+      "module_name": "Appointments",
+      "parents": ["grp", "com", "loc"]
+    }
+  ]
+}
+```
+
+**Sources:** [module_parents.json:1-471](), [Dockerfile:19]()
+
+## Integration with Authorization System
+
+The module hierarchy integrates with the broader authorization middleware to enforce access control during request processing.
+
+### Authorization Flow Integration
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant AuthMiddleware as "Auth Middleware"
+    participant RoleChecker as "Role Checker"
+    participant ModuleConfig as "Module Config"
+    participant Handler as "Request Handler"
+    
+    Client->>AuthMiddleware: Request with token
+    AuthMiddleware->>RoleChecker: Validate user roles
+    RoleChecker->>ModuleConfig: Load displayModuleRoles.json
+    ModuleConfig->>RoleChecker: Return role hierarchy
+    RoleChecker->>RoleChecker: Check module permissions
+    RoleChecker->>RoleChecker: Apply priority rules
+    RoleChecker->>AuthMiddleware: Permission result
+    AuthMiddleware->>Handler: Continue or reject
+    Handler->>Client: Response
+```
+
+**Sources:** [displayModuleRoles.json:1-1323](), [module_parents.json:1-471]()
+
+The system loads these configuration files at runtime to build the complete permission matrix that governs all module access decisions throughout the platform.

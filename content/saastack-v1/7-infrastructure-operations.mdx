@@ -1,0 +1,218 @@
+# Infrastructure & Operations
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [Jenkinsfile](Jenkinsfile)
+- [migrator.data.go](migrator.data.go)
+- [migrator.runner.go](migrator.runner.go)
+
+</details>
+
+
+
+This section covers the deployment, operations, and infrastructure management components of the waqt-deployment service. It encompasses the CI/CD pipeline, database migration system, container orchestration, and environment configuration management that enable reliable deployment and operation of the service across multiple environments.
+
+For application-level configuration and service modules, see [Core Components](#3). For security and access control in production environments, see [Security & Access Control](#5).
+
+## CI/CD Pipeline Architecture
+
+The deployment pipeline is orchestrated through Jenkins and integrates with Google Cloud Registry for container management and Google Cloud Storage for migration artifacts.
+
+```mermaid
+graph TD
+    subgraph "Jenkins Pipeline"
+        TRIGGER["Pipeline Trigger"]
+        GIT_INFO["Get Commit Details<br/>GIT_COMMIT_MSG<br/>GIT_AUTHOR"]
+        BUILD_STAGE["Build Stage"]
+    end
+    
+    subgraph "Build Process"
+        GO_CONFIG["Go Configuration<br/>GOPRIVATE Setup<br/>Private Repo Access"]
+        MOD_DOWNLOAD["Module Download<br/>go mod tidy<br/>go mod download"]
+        MIGRATION_BUILD["Migration Build<br/>-tags migrate<br/>migrator.bucket=gs://waqt-cdn"]
+        BINARY_BUILD["Binary Build<br/>CGO_ENABLED=0<br/>GOOS=linux GOARCH=amd64"]
+        DOCKER_BUILD["Docker Build<br/>appointy-global/waqt-deployment"]
+    end
+    
+    subgraph "Container Registry"
+        GCR["Google Container Registry<br/>eu.gcr.io"]
+        TAG_PUSH["Image Push<br/>t${BUILD_NUMBER}"]
+    end
+    
+    subgraph "Notification System"
+        SLACK_SUCCESS["Slack Success Notification<br/>Job Name, Build Number<br/>Commit Author, Message"]
+        SLACK_FAILURE["Slack Failure Notification<br/>Error Details"]
+    end
+    
+    TRIGGER --> GIT_INFO
+    GIT_INFO --> BUILD_STAGE
+    BUILD_STAGE --> GO_CONFIG
+    GO_CONFIG --> MOD_DOWNLOAD
+    MOD_DOWNLOAD --> MIGRATION_BUILD
+    MIGRATION_BUILD --> BINARY_BUILD
+    BINARY_BUILD --> DOCKER_BUILD
+    DOCKER_BUILD --> GCR
+    GCR --> TAG_PUSH
+    TAG_PUSH --> SLACK_SUCCESS
+    BUILD_STAGE --> SLACK_FAILURE
+```
+
+The pipeline executes in a `docker-go` container environment and manages private Go module access through credential injection. The build process includes both migration execution and binary compilation with version injection via ldflags.
+
+**Sources:** [Jenkinsfile:1-67]()
+
+## Database Migration System
+
+The migration system provides versioned database schema management with cloud-based artifact storage and optional execution modes.
+
+```mermaid
+graph TD
+    subgraph "Migration Upload Process"
+        BUILD_TRIGGER["Build with -tags migrate"]
+        VERSION_SET["Version Assignment<br/>Version = BUILD_NUMBER"]
+        CONFIG_LOAD["migrator.NewConfig<br/>Bucket Configuration"]
+        FILE_SET["migrator.SetFileName<br/>VERSION.json"]
+        UPLOAD["migrator.UploadFile<br/>GCS Bucket Upload"]
+    end
+    
+    subgraph "Migration Execution Process"
+        APP_START["Application Startup<br/>fx.Invoke(Runner)"]
+        RUNNER_INIT["migrator.Runner<br/>Database Connection<br/>Bucket Access"]
+        VERSION_CHECK["Version Resolution<br/>BaseDir + VERSION.json"]
+        MIGRATION_RUN["runner.Go<br/>Execute Migrations"]
+        POPULATOR_RUN["migrator.InvokePopulators<br/>Data Population"]
+    end
+    
+    subgraph "Google Cloud Storage"
+        GCS_BUCKET["gs://waqt-cdn<br/>Migration Artifacts"]
+        QA_DIR["qa/ Directory<br/>QA Environment"]
+        PROD_DIR["Production Directory<br/>Production Environment"]
+        HEAD_FILE["HEAD File<br/>Current Version Pointer"]
+    end
+    
+    BUILD_TRIGGER --> VERSION_SET
+    VERSION_SET --> CONFIG_LOAD
+    CONFIG_LOAD --> FILE_SET
+    FILE_SET --> UPLOAD
+    UPLOAD --> GCS_BUCKET
+    GCS_BUCKET --> QA_DIR
+    QA_DIR --> PROD_DIR
+    
+    APP_START --> RUNNER_INIT
+    RUNNER_INIT --> VERSION_CHECK
+    VERSION_CHECK --> GCS_BUCKET
+    GCS_BUCKET --> MIGRATION_RUN
+    MIGRATION_RUN --> POPULATOR_RUN
+```
+
+The migration system operates in two phases: upload during build time and execution during application startup. It supports optional migrations through configuration flags and handles both QA and production environment deployments.
+
+**Sources:** [migrator.data.go:1-106](), [migrator.runner.go:1-77]()
+
+## Migration Configuration & Execution
+
+| Component | Purpose | Key Features |
+|-----------|---------|--------------|
+| `migrator.Runner` | Migration execution engine | Bucket-based artifact retrieval, tagged query execution, optional failure handling |
+| `migrator.Config` | Configuration management | Environment-specific bucket settings, optional execution flags |
+| `migrator.SetFileName` | Version management | Build number integration, JSON file naming |
+| `migrator.UploadFile` | Artifact publishing | GCS upload, multi-environment support |
+| `InvokePopulators` | Data population | Post-migration data seeding |
+
+The migration runner supports configurable change types and includes comprehensive error handling with structured logging. Migration files are retrieved from GCS buckets using versioned URLs constructed from the application build number.
+
+**Sources:** [migrator.runner.go:16-77](), [migrator.data.go:40-106]()
+
+## Container Build Process
+
+The containerization process creates optimized production binaries with debugging support and multi-stage build capabilities.
+
+```mermaid
+graph TD
+    subgraph "Build Environment"
+        DOCKER_GO["docker-go Container<br/>Go Build Environment"]
+        CREDENTIALS["GitLab Credentials<br/>Private Repository Access"]
+        HOST_CONFIG["Host Configuration<br/>go.appointy.com Resolution"]
+    end
+    
+    subgraph "Go Build Process"
+        MOD_TIDY["go mod tidy<br/>GOPRIVATE Configuration"]
+        MOD_DOWNLOAD["go mod download<br/>Dependency Resolution"]
+        MIGRATION_EXEC["Migration Build<br/>go run -tags migrate<br/>migrator.bucket Configuration"]
+        BINARY_BUILD["Production Binary<br/>CGO_ENABLED=0<br/>Static Linking"]
+    end
+    
+    subgraph "Docker Image Creation"
+        DOCKERFILE["Dockerfile<br/>Production Image"]
+        DEBUG_DOCKERFILE["Dockerfile.debug<br/>Debug Image (Commented)"]
+        IMAGE_BUILD["docker.build<br/>appointy-global/waqt-deployment"]
+        REGISTRY_PUSH["GCR Push<br/>eu.gcr.io<br/>t${BUILD_NUMBER} Tag"]
+    end
+    
+    DOCKER_GO --> CREDENTIALS
+    CREDENTIALS --> HOST_CONFIG
+    HOST_CONFIG --> MOD_TIDY
+    MOD_TIDY --> MOD_DOWNLOAD
+    MOD_DOWNLOAD --> MIGRATION_EXEC
+    MIGRATION_EXEC --> BINARY_BUILD
+    BINARY_BUILD --> DOCKERFILE
+    DOCKERFILE --> IMAGE_BUILD
+    IMAGE_BUILD --> REGISTRY_PUSH
+```
+
+The build process includes version injection through ldflags (`-X main.Version=${BUILD_NUMBER}`) and supports both production and debug configurations. Debug builds include additional compiler flags (`-gcflags "all=-N -l"`) for debugging support.
+
+**Sources:** [Jenkinsfile:16-57]()
+
+## Environment Configuration Integration
+
+The infrastructure integrates with the application's environment configuration system through the `config.Loader` interface and supports cloud-based configuration management.
+
+| Configuration Aspect | Implementation | Environment Support |
+|---------------------|----------------|-------------------|
+| Migration Bucket | `migrator.bucket` environment variable | Development, QA, Production |
+| Build Versioning | `main.Version` ldflags injection | Automatic build number assignment |
+| Private Modules | `GOPRIVATE` environment variable | `go.appointy.com,go.saastack.io` |
+| Database Connection | Fx dependency injection | Runtime configuration loading |
+| Optional Execution | `cnf.Optional` configuration flag | Graceful failure handling |
+
+The configuration system allows for environment-specific behavior while maintaining consistent deployment processes across all environments. Migration execution can be made optional to support environments where database access may be restricted.
+
+**Sources:** [migrator.runner.go:16-29](), [migrator.data.go:40-53](), [Jenkinsfile:24-28]()
+
+## Deployment Notification System
+
+Build and deployment status notifications are delivered through Slack integration with comprehensive context information.
+
+```mermaid
+graph TD
+    subgraph "Pipeline Execution"
+        BUILD_START["Build Process Start"]
+        BUILD_SUCCESS["Build Success"]
+        BUILD_FAILURE["Build Failure"]
+    end
+    
+    subgraph "Notification Content"
+        SUCCESS_MSG["Success Message<br/>Job Name: JOB_NAME<br/>Build Number: BUILD_NUMBER<br/>Commit Author: GIT_AUTHOR<br/>Commit Message: GIT_COMMIT_MSG<br/>URL: RUN_DISPLAY_URL"]
+        FAILURE_MSG["Failure Message<br/>FAILED Status<br/>Job Context<br/>Error Information"]
+    end
+    
+    subgraph "Slack Integration"
+        SUCCESS_SLACK["slackSend<br/>Color: #00FF00<br/>Success Notification"]
+        FAILURE_SLACK["slackSend<br/>Color: #FF0000<br/>Failure Notification"]
+    end
+    
+    BUILD_START --> BUILD_SUCCESS
+    BUILD_START --> BUILD_FAILURE
+    BUILD_SUCCESS --> SUCCESS_MSG
+    BUILD_FAILURE --> FAILURE_MSG
+    SUCCESS_MSG --> SUCCESS_SLACK
+    FAILURE_MSG --> FAILURE_SLACK
+```
+
+The notification system captures Git commit details during the initial pipeline stage and includes them in both success and failure notifications, providing full deployment traceability.
+
+**Sources:** [Jenkinsfile:8-66]()

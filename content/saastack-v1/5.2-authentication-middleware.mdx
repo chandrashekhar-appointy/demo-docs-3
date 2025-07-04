@@ -1,0 +1,231 @@
+# Authentication Middleware
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [go.sum](go.sum)
+- [rate-limiter.go](rate-limiter.go)
+- [redis/redis.go](redis/redis.go)
+- [router.go](router.go)
+- [service_token.go](service_token.go)
+
+</details>
+
+
+
+This document covers the authentication middleware components within the waqt-deployment service that validate and process various forms of authentication credentials including JWT tokens, API keys, service tokens, and external tokens. For information about the role-based access control system that operates after authentication, see [Role-Based Access Control](#5.1). For details about module hierarchy and access rights enforcement, see [Module Hierarchy & Rights](#5.3).
+
+## Overview
+
+The authentication middleware system operates as a chain of HTTP middleware handlers that validate different authentication mechanisms and populate the request context with user information. The service supports four primary authentication methods: JWT tokens, API keys, service tokens, and external JWT tokens with company slug validation.
+
+```mermaid
+graph TB
+    subgraph "Middleware Chain Order"
+        A[Request] --> B["cors.Handler"]
+        B --> C["RateLimiterMiddleware"]
+        C --> D["Logger"]
+        D --> E["JWT Middleware"]
+        E --> F["ClientIpFromHeaderMiddleware"]
+        F --> G["UserInfoFromJwtMiddleware"]
+        G --> H["APIKeyMiddleware"]
+        H --> I["ServiceTokenMiddleware"]
+        I --> J["ExternalJwtMiddleware"]
+        J --> K["EnforceAuthenticationCheckMiddleware"]
+        K --> L["Handler"]
+    end
+    
+    subgraph "Authentication Methods"
+        M["JWT Token<br/>Authorization Header"]
+        N["API Key<br/>X-API-KEY Header"]
+        O["Service Token<br/>X-Service-Token Header"]
+        P["External JWT<br/>Authorization Header + x-slug Header"]
+    end
+    
+    E -.-> M
+    H -.-> N
+    I -.-> O
+    J -.-> P
+```
+
+**Sources:** [router.go:120-148]()
+
+## Authentication Middleware Components
+
+### JWT Middleware Chain
+
+The JWT authentication flow involves two middleware components that work together:
+
+| Component | Purpose | Implementation |
+|-----------|---------|----------------|
+| `JWT Middleware` | Token validation and parsing | External dependency |
+| `UserInfoFromJwtMiddleware` | User profile retrieval and context population | `auth.UserInfoFromJwtMiddleware` |
+
+The JWT middleware validates tokens from the `Authorization` header and the subsequent `UserInfoFromJwtMiddleware` fetches complete user profile information from the user service.
+
+**Sources:** [router.go:136](), [router.go:140]()
+
+### API Key Middleware
+
+The `APIKeyMiddleware` validates API keys provided in the `X-API-KEY` header and converts them to user context information.
+
+```mermaid
+graph LR
+    A["Request with<br/>X-API-KEY Header"] --> B["APIKeyMiddleware"]
+    B --> C["ValidateApiKey<br/>apiKeypb.ApiKeysClient"]
+    C --> D["GetUserProfile<br/>userpb.UserProfilesClient"]
+    D --> E["UserInfo Context<br/>userinfo.NewContext"]
+    
+    B --> F["No API Key"]
+    F --> G["Continue Chain"]
+    
+    C --> H["Invalid Key"]
+    H --> I["401 Unauthorized"]
+    
+    D --> J["User Not Found"]
+    J --> K["500 Internal Error"]
+```
+
+The middleware handles special routing for Zapier integrations, requiring API key authentication for paths containing "zapier".
+
+**Sources:** [router.go:565-608](), [router.go:553-563]()
+
+### Service Token Middleware
+
+The `ServiceTokenMiddleware` validates service tokens from the `X-Service-Token` header, providing service-to-service authentication.
+
+```mermaid
+graph TB
+    A["Request with<br/>X-Service-Token Header"] --> B["ServiceTokenMiddleware"]
+    B --> C["GetServiceTokenByTokenValue<br/>serTokpb.ServiceTokensClient"]
+    C --> D["Validate Active Status"]
+    D --> E["Check Expiry"]
+    E --> F["UpdateLastUsedOn"]
+    F --> G["Create UserInfo Context<br/>IsServiceToken: true"]
+    
+    B --> H["No Service Token"]
+    H --> I["Continue Chain"]
+    
+    C --> J["Token Not Found"]
+    J --> K["401 Unauthorized"]
+    
+    D --> L["Inactive Token"]
+    L --> M["412 Precondition Failed"]
+    
+    E --> N["Expired Token"]
+    N --> O["412 Precondition Failed"]
+```
+
+Service tokens include additional validation for active status and expiration, and they update the last used timestamp upon successful validation.
+
+**Sources:** [service_token.go:29-93](), [service_token.go:15-27]()
+
+### External JWT Middleware
+
+The `NewExternalJWtMiddleware` handles external JWT tokens that require company slug validation, typically used for tenant-specific authentication.
+
+```mermaid
+graph LR
+    A["Request with<br/>Authorization Header<br/>+ x-slug Header"] --> B["ExternalJwtMiddleware"]
+    B --> C["Extract Token and Slug"]
+    C --> D["VerifyExternalToken<br/>userPb.UserProfilesClient"]
+    D --> E["Create UserInfo Context"]
+    
+    B --> F["Missing Token or Slug"]
+    F --> G["Continue Chain"]
+    
+    D --> H["Verification Failed"]
+    H --> I["Continue Chain<br/>(Silent Failure)"]
+```
+
+This middleware silently continues the chain on authentication failure, allowing other authentication methods to be attempted.
+
+**Sources:** [router.go:610-647](), [router.go:649-652]()
+
+## Authentication Flow
+
+The complete authentication flow processes multiple authentication mechanisms in sequence:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant "JWT MW" as jwt
+    participant "API Key MW" as api
+    participant "Service Token MW" as svc
+    participant "External JWT MW" as ext
+    participant "UserInfo Context" as ctx
+    
+    Client->>jwt: Request with headers
+    
+    alt JWT Token Present
+        jwt->>ctx: Populate UserInfo from JWT
+    else No JWT
+        jwt->>api: Continue chain
+        
+        alt API Key Present
+            api->>ctx: Validate API Key & Create UserInfo
+        else No API Key
+            api->>svc: Continue chain
+            
+            alt Service Token Present
+                svc->>ctx: Validate Service Token & Create UserInfo
+            else No Service Token
+                svc->>ext: Continue chain
+                
+                alt External JWT + Slug Present
+                    ext->>ctx: Verify External Token & Create UserInfo
+                else No External Auth
+                    ext->>ctx: Continue with empty UserInfo
+                end
+            end
+        end
+    end
+```
+
+**Sources:** [router.go:120-148]()
+
+## Authentication Enforcement
+
+### EnforceAuthenticationCheckMiddleware
+
+The `EnforceAuthenticationCheckMiddleware` provides optional strict authentication enforcement controlled by the `ENFORCE_AUTHENTICATION_CHECK` environment variable.
+
+| Path Pattern | Enforcement | Special Cases |
+|--------------|-------------|---------------|
+| `/api/*` | Required when enabled | UUID code parameter bypasses |
+| `/graphql` | Required when enabled | UUID code parameter bypasses |
+| Other paths | Not enforced | Always allowed |
+
+The middleware allows requests with valid UUID codes in query parameters to bypass authentication requirements.
+
+**Sources:** [router.go:303-342](), [router.go:55-56]()
+
+### Configuration
+
+| Middleware | Configuration Source | Key Components |
+|------------|---------------------|----------------|
+| API Key | `ApiMiddleWareConfig` | `apiKeypb.ApiKeysClient`, `userpb.UserProfilesClient` |
+| Service Token | `ServiceTokenMiddleWareConfig` | `serTokpb.ServiceTokensClient` |
+| External JWT | Function parameters | `userPb.UserProfilesClient`, `*zap.Logger` |
+| Enforcement | Environment variable | `ENFORCE_AUTHENTICATION_CHECK` |
+
+**Sources:** [router.go:72-73](), [router.go:94-96](), [service_token.go:19-27]()
+
+## Context Population
+
+All authentication middleware components populate the request context using the `userinfo.UserInfo` structure:
+
+```go
+type UserInfo struct {
+    Id             string
+    Email          string  
+    TokenExpiry    time.Time
+    IsServiceToken bool
+}
+```
+
+The context is created using `userinfo.NewContext(ctx, userInfo)` and can be retrieved in downstream handlers using `userinfo.FromContext(ctx)`.
+
+**Sources:** [router.go:592-596](), [service_token.go:85-91](), [router.go:641-644]()

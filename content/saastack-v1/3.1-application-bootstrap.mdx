@@ -1,0 +1,283 @@
+# Application Bootstrap
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [main.go](main.go)
+- [modules.go](modules.go)
+
+</details>
+
+
+
+This document covers the application startup process, dependency injection setup, and module configuration for the waqt-deployment service. The bootstrap process uses Uber's fx framework to manage dependency injection and lifecycle management across numerous microservice modules.
+
+For information about HTTP routing and middleware configuration, see [Routing & Middleware](#3.2). For details about individual service module implementations, see [Service Modules](#3.3).
+
+## Overview
+
+The waqt-deployment service bootstrap process initializes a comprehensive microservices gateway that orchestrates over 100 individual service modules. The application uses the fx dependency injection framework to manage complex inter-service dependencies and coordinate startup/shutdown sequences across multiple protocol handlers (HTTP, gRPC, GraphQL).
+
+## Dependency Injection Framework
+
+The application is built on Uber's fx framework, which provides constructor-based dependency injection and lifecycle management. The fx framework enables declarative module composition and automatic dependency resolution.
+
+### Core fx Components
+
+| Component | Purpose | Location |
+|-----------|---------|----------|
+| `fx.New()` | Application container creation | [main.go:56]() |
+| `fx.Options` | Module aggregation | [modules.go:155]() |
+| `fx.Provide` | Dependency registration | [main.go:89-97]() |
+| `fx.Invoke` | Service startup functions | [main.go:109-120]() |
+
+The application container is initialized with structured module registration that separates infrastructure concerns from business logic.
+
+```mermaid
+graph TD
+    subgraph "Bootstrap Sequence"
+        MAIN["main()"] --> RUN["run()"]
+        RUN --> FX_NEW["fx.New()"]
+        FX_NEW --> MODULE_REG["Module Registration"]
+        MODULE_REG --> DEP_RESOLVE["Dependency Resolution"]
+        DEP_RESOLVE --> LIFECYCLE["Lifecycle Management"]
+        LIFECYCLE --> APP_RUN["app.Run()"]
+    end
+    
+    subgraph "Module Categories"
+        INFRA["Infrastructure Modules<br/>config, log, sql, redis"]
+        AUTH["Authentication Modules<br/>auth, right, roles"]
+        PROTO["Protocol Modules<br/>http, grpc, graphql"]
+        BUSINESS["Business Modules<br/>ServiceModules"]
+    end
+    
+    MODULE_REG --> INFRA
+    MODULE_REG --> AUTH
+    MODULE_REG --> PROTO
+    MODULE_REG --> BUSINESS
+```
+
+Sources: [main.go:54-131](), [modules.go:155-312]()
+
+## Application Structure
+
+The main application setup follows a layered initialization pattern where infrastructure modules are registered before business logic modules.
+
+### Core Application Setup
+
+```mermaid
+graph TB
+    subgraph "Application Container Setup"
+        APP_START["fx.New()"] --> VERSION_PROVIDER["Version Provider"]
+        VERSION_PROVIDER --> LOGGER["Logger Configuration"]
+        LOGGER --> CORE_MODULES["Core Infrastructure"]
+        CORE_MODULES --> SERVICE_MODULES["Business Service Modules"]
+        SERVICE_MODULES --> INVOCATION["Service Invocation"]
+    end
+    
+    subgraph "Core Infrastructure"
+        GRPC_MOD["grpc.Module"]
+        RIGHT_MOD["right.Module"] 
+        ROLES_MOD["roles.Module"]
+        AUTH_MOD["auth.Module"]
+        CONFIG_MOD["config.Module"]
+        HTTP_MOD["http.Module"]
+        LOG_MOD["log.Module"]
+        REDIS_MOD["redis.Module"]
+        SQL_MOD["sql.Module"]
+    end
+    
+    subgraph "Service Invocation"
+        GRPC_SERVER["grpc.RunServer"]
+        HTTP_SERVER["http.RunServer"] 
+        GRAPHQL_REG["RegisterGraphQLConnections"]
+        CONFIG_PRINT["config.PrintConfig"]
+    end
+    
+    CORE_MODULES --> GRPC_MOD
+    CORE_MODULES --> RIGHT_MOD
+    CORE_MODULES --> ROLES_MOD
+    CORE_MODULES --> AUTH_MOD
+    CORE_MODULES --> CONFIG_MOD
+    CORE_MODULES --> HTTP_MOD
+    CORE_MODULES --> LOG_MOD
+    CORE_MODULES --> REDIS_MOD
+    CORE_MODULES --> SQL_MOD
+    
+    INVOCATION --> GRPC_SERVER
+    INVOCATION --> HTTP_SERVER
+    INVOCATION --> GRAPHQL_REG
+    INVOCATION --> CONFIG_PRINT
+```
+
+The bootstrap process includes several custom provider functions and invocation hooks:
+
+- **Version Provider**: [main.go:57-59]() provides build version information
+- **Logger Configuration**: [main.go:60]() sets up structured logging
+- **Error Handler**: [main.go:83]() configures error handling hooks
+- **Metric Tracker**: [main.go:96]() initializes telemetry collection
+
+Sources: [main.go:56-83]()
+
+## Service Module Registration
+
+The application aggregates over 100 microservice modules through the `ServiceModules` variable, which combines modules from two primary domains.
+
+### Module Domain Categories
+
+```mermaid
+graph LR
+    subgraph "ServiceModules fx.Options"
+        SERVICE_MODULES["ServiceModules"]
+    end
+    
+    subgraph "go.appointy.com/waqt Domain"
+        WAQT_APPOINTMENT["appointment.Module"]
+        WAQT_SERVICE["service.Module"] 
+        WAQT_RESOURCE["resource.Module"]
+        WAQT_CALENDAR["calendarEntities.CalendarInfoModule"]
+        WAQT_BOOKING["appointment_booking_flow_settings.Module"]
+        WAQT_INTAKE["intakeForm.Module"]
+        WAQT_OTHER["...50+ other waqt modules"]
+    end
+    
+    subgraph "go.saastack.io Domain"
+        SAAS_USER["userProfile.Module"]
+        SAAS_COMPANY["company.Module"]
+        SAAS_CUSTOMER["customer.Module"]
+        SAAS_EMPLOYEE["employee.Module"]
+        SAAS_BILLING["billing.Module"]
+        SAAS_AUTH["authentication.Module"]
+        SAAS_OTHER["...50+ other saastack modules"]
+    end
+    
+    SERVICE_MODULES --> WAQT_APPOINTMENT
+    SERVICE_MODULES --> WAQT_SERVICE
+    SERVICE_MODULES --> WAQT_RESOURCE
+    SERVICE_MODULES --> WAQT_CALENDAR
+    SERVICE_MODULES --> WAQT_BOOKING
+    SERVICE_MODULES --> WAQT_INTAKE
+    SERVICE_MODULES --> WAQT_OTHER
+    
+    SERVICE_MODULES --> SAAS_USER
+    SERVICE_MODULES --> SAAS_COMPANY
+    SERVICE_MODULES --> SAAS_CUSTOMER
+    SERVICE_MODULES --> SAAS_EMPLOYEE
+    SERVICE_MODULES --> SAAS_BILLING
+    SERVICE_MODULES --> SAAS_AUTH
+    SERVICE_MODULES --> SAAS_OTHER
+```
+
+### Module Import Structure
+
+The module imports are organized into logical groups within [modules.go:3-153]():
+
+| Import Group | Examples | Purpose |
+|--------------|----------|---------|
+| Core Booking | `appointment`, `service`, `resource` | Primary booking functionality |
+| Time Management | `blockHour`, `openHour`, `calendar-entities` | Availability management |
+| Customer Experience | `intake-form`, `customer-settings`, `booking-portal-settings` | Customer-facing features |
+| Platform Services | `user`, `company`, `employee`, `billing` | Multi-tenant platform functionality |
+| Integrations | `calendar-integration`, `intercom`, `zapier` | External system connectivity |
+
+Sources: [modules.go:1-153](), [modules.go:155-312]()
+
+## Bootstrap Process Flow
+
+The application bootstrap follows a specific sequence to ensure proper dependency resolution and service startup.
+
+### Startup Sequence
+
+```mermaid
+sequenceDiagram
+    participant MAIN as "main()"
+    participant FX as "fx.New()"
+    participant INFRA as "Infrastructure"
+    participant AUTH as "Authentication"
+    participant SERVICES as "Business Services"
+    participant SERVERS as "Protocol Servers"
+    
+    MAIN->>FX: Create application container
+    FX->>INFRA: Initialize config, log, sql, redis
+    INFRA->>AUTH: Setup auth providers, roles, rights
+    AUTH->>SERVICES: Load business service modules
+    SERVICES->>FX: Dependency resolution complete
+    FX->>SERVERS: Invoke server startup
+    SERVERS->>MAIN: Application running
+    
+    Note over SERVERS: grpc.RunServer, http.RunServer
+    Note over SERVICES: 100+ microservice modules
+    Note over AUTH: JWT, API keys, service tokens
+```
+
+### Critical Startup Functions
+
+The `fx.Invoke` section orchestrates the final startup sequence:
+
+1. **Server Initialization**: [main.go:110]() - `grpc.RunServer` starts gRPC services
+2. **GraphQL Setup**: [main.go:111-114]() - Registers GraphQL connections and subscriptions  
+3. **HTTP Server**: [main.go:115]() - `http.RunServer` starts HTTP endpoints
+4. **Configuration**: [main.go:116]() - `config.PrintConfig` outputs active configuration
+5. **Version Logging**: [main.go:117-119]() - Logs build version information
+
+Sources: [main.go:109-121]()
+
+## Deployment-Specific Modules
+
+Beyond the shared service modules, the application includes deployment-specific modules that extend core functionality:
+
+### Internal Extension Modules
+
+```mermaid
+graph TB
+    subgraph "Deployment-Specific Modules"
+        ENV_CONFIG["envConfig.Module"]
+        LINKS_MOD["links.Module"]
+        ADDON_MOD["addon.Module"] 
+        LICENSE_MOD["license.Module"]
+        ROLES_MOD["roles.Module"]
+        SLUGS_MOD["slugs.Module"]
+        REDIS_MOD["redis.Module"]
+    end
+    
+    subgraph "Business Logic Extensions"
+        DISCOUNT_ITEMS["discount_items.Module"]
+        MEMBERSHIP_ITEMS["membership_items.Module"]
+        EMAIL_UPDATE["email_update.Module"]
+        PROFESSION_SETUP["profession_setup.Module"]
+        POLICY_SOURCES["sources.Module"]
+    end
+    
+    subgraph "Custom Providers"
+        ROUTER_MODULE["RouterModule"]
+        AUTH_PROVIDER["AuthProviderModule"]
+        EXPOSURE_CONFIG["NewExposureConfig"]
+        METRIC_TRACKER["metrictracker.NewMetricTracker"]
+    end
+```
+
+These modules are defined in the deployment repository and provide:
+
+- **Environment Configuration**: Application-specific environment handling
+- **Link Management**: URL generation and validation
+- **License Validation**: Feature licensing and usage limits
+- **Role Definitions**: Deployment-specific role configurations
+- **Business Extensions**: Discount processing, membership handling
+
+Sources: [main.go:9-20](), [main.go:70-104]()
+
+## Error Handling and Lifecycle
+
+The bootstrap process includes comprehensive error handling and graceful shutdown capabilities through fx lifecycle hooks and error handlers.
+
+### Error Management
+
+- **Startup Errors**: [main.go:124-126]() checks `app.Err()` before running
+- **Runtime Errors**: [main.go:83]() registers `log.ErrorHandler` for fx error hooks
+- **Graceful Shutdown**: fx framework handles service shutdown ordering automatically
+
+The application will fail fast if any critical dependencies cannot be resolved during the bootstrap phase, ensuring consistent deployment behavior across environments.
+
+Sources: [main.go:48-131]()

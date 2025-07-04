@@ -1,0 +1,496 @@
+# API Layer
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [graphql.go](graphql.go)
+- [rate-limiter.go](rate-limiter.go)
+- [redis/redis.go](redis/redis.go)
+- [router.go](router.go)
+
+</details>
+
+
+
+This document covers all API interfaces provided by the system including GraphQL, gRPC, and HTTP endpoints. It details the request processing pipeline, authentication mechanisms, middleware chain, and service registration patterns. For specific business logic implementation details, see [Business Logic](#6). For authentication and authorization specifics, see [Security & Access Control](#5).
+
+## API Layer Architecture
+
+The API layer provides multiple entry points for client applications through GraphQL, gRPC, and HTTP REST endpoints. The system uses a sophisticated middleware chain for request processing, authentication, and security.
+
+```mermaid
+graph TB
+    subgraph "Client Interfaces"
+        WEB["Web Clients"]
+        MOBILE["Mobile Apps"] 
+        API_CLIENTS["API Clients"]
+        GRPC_CLIENTS["gRPC Clients"]
+    end
+    
+    subgraph "API Gateway"
+        ROUTER["router.go NewChain()"]
+        CORS["CORS Middleware"]
+        RATE_LIMIT["RateLimiterMiddleware"]
+        AUTH_CHAIN["Authentication Chain"]
+    end
+    
+    subgraph "API Endpoints"
+        GRAPHQL_EP["GraphQL Endpoint /graphql"]
+        GRPC_EP["gRPC Server"]
+        HTTP_EP["HTTP REST /api/*"]
+        RUNTIME_MUX["runtime.ServeMux"]
+    end
+    
+    subgraph "Processing Layer"
+        GRAPHQL_SCHEMA["schemabuilder.Schema"]
+        GRPC_INTERCEPTORS["gRPC Interceptors"]
+        MIDDLEWARE_CHAIN["alice.Chain"]
+    end
+    
+    WEB --> ROUTER
+    MOBILE --> ROUTER
+    API_CLIENTS --> ROUTER
+    GRPC_CLIENTS --> GRPC_EP
+    
+    ROUTER --> CORS
+    CORS --> RATE_LIMIT
+    RATE_LIMIT --> AUTH_CHAIN
+    
+    AUTH_CHAIN --> GRAPHQL_EP
+    AUTH_CHAIN --> HTTP_EP
+    AUTH_CHAIN --> RUNTIME_MUX
+    
+    GRAPHQL_EP --> GRAPHQL_SCHEMA
+    GRPC_EP --> GRPC_INTERCEPTORS
+    HTTP_EP --> MIDDLEWARE_CHAIN
+    RUNTIME_MUX --> MIDDLEWARE_CHAIN
+```
+
+Sources: [router.go:62-98](), [router.go:535-538](), [graphql.go:9-28]()
+
+## Request Processing Pipeline
+
+The `NewChain()` function in [router.go:100-163]() defines the complete middleware processing pipeline. Each request flows through this ordered chain of middleware components.
+
+**Middleware Chain Processing Order**
+
+```mermaid
+graph LR
+    subgraph "alice.Chain Middleware Order"
+        RECOVERER["Recoverer"]
+        HEARTBEAT["middleware.Heartbeat('/_ah/health')"]
+        CORS_MW["cors.New(cors.Options{...}).Handler"]
+        RATE_MW["RateLimiterConfig.RateLimiterMiddleware"]
+        LOGGER["in.Logger alice.Constructor"]
+        JWT_MW["in.Jwt alice.Constructor"]
+        CLIENT_IP["ClientIpFromHeaderMiddleware"]
+        CAPTCHA_X["SetCaptchaResponseInContext"]
+        CAPTCHA_G["SetGoogleCaptchaResponseInContext"]
+        USER_INFO["auth.UserInfoFromJwtMiddleware(in.UserCli)"]
+        VERSION["version.Handler(Version)"]
+        SKIP_RIGHT["graphql.SkipRightHeaderMiddleware"]
+        API_KEY["ApiMiddleWareConfig.APIKeyMiddleware"]
+        SERVICE_TOKEN["ServiceTokenMiddleWareConfig.ServiceTokenMiddleware"]
+        EXTERNAL_JWT["in.ExternalJwt alice.Constructor"]
+        AUTH_CHECK["EnforceAuthenticationCheckMiddleware"]
+        ACTIVITY_LOG["TrackUserCompanyActivityLog(in.DB, in.Cache)"]
+        COMPRESS["middleware.DefaultCompress"]
+        OIDC["in.Oidc alice.Constructor"]
+        GRPC_WEB["in.GrpcWeb alice.Constructor"]
+    end
+    
+    REQUEST["HTTP Request"] --> RECOVERER
+    RECOVERER --> HEARTBEAT
+    HEARTBEAT --> CORS_MW
+    CORS_MW --> RATE_MW
+    RATE_MW --> LOGGER
+    LOGGER --> JWT_MW
+    JWT_MW --> CLIENT_IP
+    CLIENT_IP --> CAPTCHA_X
+    CAPTCHA_X --> CAPTCHA_G
+    CAPTCHA_G --> USER_INFO
+    USER_INFO --> VERSION
+    VERSION --> SKIP_RIGHT
+    SKIP_RIGHT --> API_KEY
+    API_KEY --> SERVICE_TOKEN
+    SERVICE_TOKEN --> EXTERNAL_JWT
+    EXTERNAL_JWT --> AUTH_CHECK
+    AUTH_CHECK --> ACTIVITY_LOG
+    ACTIVITY_LOG --> COMPRESS
+    COMPRESS --> OIDC
+    OIDC --> GRPC_WEB
+    GRPC_WEB --> HANDLER["Request Handler"]
+```
+
+The middleware chain is conditionally configured based on environment variables:
+- `REMOVE_COMPRESSOR` controls whether `middleware.DefaultCompress` is included
+- `ENFORCE_AUTHENTICATION_CHECK` controls authentication enforcement
+- `TRACK_USER_COMPANY_ACTIVITY_TIMESTAMP` controls activity logging
+
+Sources: [router.go:100-163](), [router.go:303-342](), [router.go:344-373](), [router.go:150-152]()
+
+## Authentication Mechanisms
+
+The API layer implements a multi-layered authentication system supporting four distinct authentication methods with specific header requirements and validation flows.
+
+**Authentication Flow Architecture**
+
+```mermaid
+graph TD
+    subgraph "Authentication Headers"
+        AUTH_HEADER["Authorization: Bearer <token>"]
+        API_KEY_HDR["X-API-KEY: <api_key>"]
+        SERVICE_TOKEN_HDR["X-Service-Token: <service_token>"]
+        SLUG_HEADER["x-slug: <company_slug>"]
+    end
+    
+    subgraph "Middleware Validators"
+        JWT_VALIDATE["in.Jwt alice.Constructor"]
+        API_VALIDATE["ApiMiddleWareConfig.APIKeyMiddleware"]
+        SERVICE_VALIDATE["ServiceTokenMiddleWareConfig.ServiceTokenMiddleware"]
+        EXTERNAL_VALIDATE["NewExternalJWtMiddleware"]
+    end
+    
+    subgraph "Validation Services"
+        JWT_STANDARD["Standard JWT verification"]
+        API_KEY_SVC["apiKeypb.ApiKeysClient.ValidateApiKey()"]
+        SERVICE_TOKEN_SVC["GetServiceTokenByTokenValue()"]
+        EXTERNAL_JWT_SVC["userPb.UserProfilesClient.VerifyExternalToken()"]
+    end
+    
+    subgraph "User Context Creation"
+        USER_PROFILE_GET["userpb.UserProfilesClient.GetUserProfile()"]
+        USER_INFO_STRUCT["userinfo.UserInfo{Id, Email}"]
+        CONTEXT_INJECTION["userinfo.NewContext(r.Context(), ui)"]
+    end
+    
+    subgraph "Error Handling"
+        UNAUTHENTICATED["codes.Unauthenticated → 401"]
+        INTERNAL_ERROR["codes.Internal → 500"]
+        ZAPIER_CHECK["strings.Contains(r.URL.Path, 'zapier')"]
+        NOT_FOUND_SKIP["errors.ErrNotFound → continue"]
+    end
+    
+    AUTH_HEADER --> JWT_VALIDATE
+    API_KEY_HDR --> API_VALIDATE
+    SERVICE_TOKEN_HDR --> SERVICE_VALIDATE
+    SLUG_HEADER --> EXTERNAL_VALIDATE
+    
+    JWT_VALIDATE --> JWT_STANDARD
+    API_VALIDATE --> API_KEY_SVC
+    SERVICE_VALIDATE --> SERVICE_TOKEN_SVC
+    EXTERNAL_VALIDATE --> EXTERNAL_JWT_SVC
+    
+    API_KEY_SVC --> USER_PROFILE_GET
+    USER_PROFILE_GET --> USER_INFO_STRUCT
+    SERVICE_TOKEN_SVC --> USER_INFO_STRUCT
+    EXTERNAL_JWT_SVC --> USER_INFO_STRUCT
+    JWT_STANDARD --> USER_INFO_STRUCT
+    
+    USER_INFO_STRUCT --> CONTEXT_INJECTION
+    
+    API_KEY_SVC --> UNAUTHENTICATED
+    API_KEY_SVC --> INTERNAL_ERROR
+    API_VALIDATE --> ZAPIER_CHECK
+    EXTERNAL_VALIDATE --> NOT_FOUND_SKIP
+```
+
+**Authentication Method Details**
+
+| Method | Header | Validation Function | User Resolution |
+|--------|--------|---------------------|-----------------|
+| **JWT** | `Authorization: Bearer <token>` | Standard JWT verification | From JWT claims |
+| **API Key** | `X-API-KEY: <key>` | `apiKeypb.ApiKeysClient.ValidateApiKey()` | `GetUserProfile(apiKey.UserId)` |
+| **Service Token** | `X-Service-Token: <token>` | `GetServiceTokenByTokenValue()` | Service-to-service context |
+| **External JWT** | `Authorization: Bearer <token>` + `x-slug: <slug>` | `VerifyExternalToken(token, slug)` | External system integration |
+
+**Special Authentication Logic**:
+- **Zapier Integration**: API key is required for any URL containing "zapier" [router.go:600-605]()
+- **External JWT**: Requires both JWT token and company slug header [router.go:624-633]()
+- **Service Token**: Used for internal service-to-service communication
+- **Enforcement**: `EnforceAuthenticationCheckMiddleware` can require authentication on `/api` and `/graphql` paths [router.go:303-342]()
+
+Sources: [router.go:553-608](), [router.go:610-647](), [router.go:140-147](), [router.go:303-342]()
+
+## GraphQL Implementation
+
+The GraphQL layer uses Jaal framework with `schemabuilder.Schema` registration and comprehensive middleware for security and performance.
+
+**GraphQL Schema Registration Flow**
+
+```mermaid
+graph TB
+    subgraph "Schema Registration Process"
+        INVOKE["fx.Invoke InvokeGraphQLServices"]
+        SCHEMA_IN["RegisterGraphqlSchemasIn struct"]
+        EXPOSURE_CHECK["ExposureConfig.Graphql bool"]
+        TIMEOUT_TEST["RegisterGqlTimeoutTest(in.Schema)"]
+        SCHEMA_LOOP["for _, f := range in.GraphQLRegister"]
+        SCHEMA_CALL["f(in.Schema)"]
+    end
+    
+    subgraph "Jaal Middleware Chain"
+        THROTTLE_IP["throttle.NewLimitCounter IpThrottleKey"]
+        THROTTLE_USER["throttle.NewLimitCounter UserIdThrottleKey"]
+        BATCH_LIMIT["config.BatchLimitMiddleware"]
+        TRACE_MW["telemetry.TraceMiddleware"]
+        ERROR_LOG["log.JaalErrorLogger"]
+        TIMEOUT_HANDLER["Timeout Handler with context.WithTimeout"]
+        DEPTH_VALIDATOR["selectionSetDepth validation"]
+    end
+    
+    subgraph "Query Processing"
+        JAAL_QUERY["jaalG.Query"]
+        TIMEOUT_CONFIG["TimeoutConfig.Seconds"]
+        CUSTOM_TIMEOUT["TimeoutConfig.SecondsForCustoms"]
+        DEPTH_CONFIG["RecursiveDepthConfig.DepthLimit"]
+        PANIC_RECOVERY["Panic Recovery Channel"]
+    end
+    
+    INVOKE --> SCHEMA_IN
+    SCHEMA_IN --> EXPOSURE_CHECK
+    EXPOSURE_CHECK --> TIMEOUT_TEST
+    TIMEOUT_TEST --> SCHEMA_LOOP
+    SCHEMA_LOOP --> SCHEMA_CALL
+    
+    SCHEMA_CALL --> THROTTLE_IP
+    THROTTLE_IP --> THROTTLE_USER
+    THROTTLE_USER --> BATCH_LIMIT
+    BATCH_LIMIT --> TRACE_MW
+    TRACE_MW --> ERROR_LOG
+    ERROR_LOG --> TIMEOUT_HANDLER
+    TIMEOUT_HANDLER --> DEPTH_VALIDATOR
+    
+    JAAL_QUERY --> TIMEOUT_CONFIG
+    TIMEOUT_CONFIG --> CUSTOM_TIMEOUT
+    CUSTOM_TIMEOUT --> DEPTH_CONFIG
+    DEPTH_CONFIG --> PANIC_RECOVERY
+```
+
+**GraphQL Timeout and Depth Configuration**
+
+The system implements sophisticated query protection mechanisms:
+
+| Configuration | Default Value | Purpose |
+|---------------|---------------|---------|
+| `TimeoutConfig.Seconds` | 30 seconds | Standard query timeout |
+| `TimeoutConfig.SecondsForCustoms` | 60 seconds | Extended timeout for heavy queries |
+| `RecursiveDepthConfig.DepthLimit` | 10 levels | Maximum query depth protection |
+
+The `selectionSetDepth()` function [router.go:685-699]() recursively analyzes query structure to prevent deep nested queries that could cause performance issues. The `uniqueNames()` function [router.go:724-769]() extracts all field names for depth analysis.
+
+Sources: [graphql.go:9-28](), [router.go:433-504](), [router.go:685-776](), [router.go:416-431](), [router.go:674-683]()
+
+## gRPC Services and Interceptors
+
+The `NewInterceptors()` function [router.go:388-406]() defines the complete gRPC interceptor chain with precise ordering for request processing.
+
+**gRPC Interceptor Chain Architecture**
+
+```mermaid
+graph LR
+    subgraph "Interceptor Processing Order"
+        RECOVERY["grpcrecovery.UnaryServerInterceptor()"]
+        JWT_GRPC["in.Jwt grpc.UnaryServerInterceptor"]
+        GRPC_WRAPPER["in.GrpcWrapper grpcWrapper.GrpcMethodSkipMiddleware"]
+        USER_INTERCEPTOR["auth.UserInfoFromJwtUnaryInterceptor(in.UserCli)"]
+        CLIENT_IP_GRPC["ClientIpInterceptor"]
+        VERSION_GRPC["version.Interceptor(Version)"]
+        LOG_GRPC["in.LogInterceptor"]
+        IDENTIFY_GRPC["IdentifyGrpcCall"]
+    end
+    
+    subgraph "Context Enhancement Functions"
+        PEER_EXTRACT["peer.FromContext(ctx)"]
+        CLIENT_IP_CTX["userinfo.NewContextWithClientIP(ctx, p.Addr.String())"]
+        GRPC_FLAG["userinfo.NewContextForGrpcCall(ctx)"]
+    end
+    
+    subgraph "Bypass Mechanism"
+        BYPASS_FUNC["grpcWrapper.ByPassFunc"]
+        METADATA_CHECK["metadata.FromIncomingContext(ctx)"]
+        SKIP_HEADER["graphql.SkipRightHeaderKey"]
+        SKIP_VALUE["graphql.SkipRightHeaderValue"]
+    end
+    
+    GRPC_REQUEST["gRPC Request"] --> RECOVERY
+    RECOVERY --> JWT_GRPC
+    JWT_GRPC --> GRPC_WRAPPER
+    GRPC_WRAPPER --> USER_INTERCEPTOR
+    USER_INTERCEPTOR --> CLIENT_IP_GRPC
+    CLIENT_IP_GRPC --> VERSION_GRPC
+    VERSION_GRPC --> LOG_GRPC
+    LOG_GRPC --> IDENTIFY_GRPC
+    
+    CLIENT_IP_GRPC --> PEER_EXTRACT
+    PEER_EXTRACT --> CLIENT_IP_CTX
+    IDENTIFY_GRPC --> GRPC_FLAG
+    
+    GRPC_WRAPPER --> BYPASS_FUNC
+    BYPASS_FUNC --> METADATA_CHECK
+    METADATA_CHECK --> SKIP_HEADER
+    SKIP_HEADER --> SKIP_VALUE
+```
+
+**Special Interceptor Functions**
+
+The gRPC layer includes specialized interceptors for different purposes:
+
+- **`ClientIpInterceptor`** [router.go:375-381](): Extracts client IP from `peer.FromContext()` and injects it into request context
+- **`IdentifyGrpcCall`** [router.go:383-386](): Marks requests as gRPC calls using `userinfo.NewContextForGrpcCall()`
+- **Bypass Mechanism** [router.go:75-83](): Allows skipping middleware based on `graphql.SkipRightHeaderKey` metadata
+
+Sources: [router.go:388-406](), [router.go:375-381](), [router.go:383-386](), [router.go:75-83]()
+
+## HTTP Routing and Middleware Configuration
+
+The HTTP layer uses the Chi router with Alice middleware chaining and gRPC-Gateway for protocol bridging.
+
+| Middleware Component | Purpose | Configuration |
+|---------------------|---------|---------------|
+| `Recoverer` | Panic recovery | [router.go:506-519]() |
+| `Heartbeat` | Health check endpoint | `/_ah/health` |
+| `CORS` | Cross-origin resource sharing | [router.go:254-301]() |
+| `RateLimiterMiddleware` | Request rate limiting | [rate-limiter.go:78-120]() |
+| `APIKeyMiddleware` | API key authentication | [router.go:565-608]() |
+| `ServiceTokenMiddleware` | Service-to-service auth | [router.go:144]() |
+| `ExternalJWTMiddleware` | External JWT validation | [router.go:610-647]() |
+| `TrackUserCompanyActivityLog` | Activity logging | [router.go:165-252]() |
+
+The system uses `runtime.ServeMux` from gRPC-Gateway for HTTP-to-gRPC protocol bridging:
+
+```mermaid
+graph LR
+    subgraph "HTTP to gRPC Bridge"
+        HTTP_REQ["HTTP Request"]
+        RUNTIME_MUX["runtime.ServeMux"]
+        GRPC_SERVICE["gRPC Service"]
+        JSON_PB["runtime.JSONPb"]
+        PROTOBUF["application/x-protobuf"]
+    end
+    
+    HTTP_REQ --> RUNTIME_MUX
+    RUNTIME_MUX --> JSON_PB
+    RUNTIME_MUX --> PROTOBUF
+    JSON_PB --> GRPC_SERVICE
+    PROTOBUF --> GRPC_SERVICE
+```
+
+Sources: [router.go:535-538](), [router.go:100-163]()
+
+## Rate Limiting and Security
+
+The rate limiting system uses `golang.org/x/time/rate` package with an in-memory visitor tracking system and automated cleanup.
+
+**Rate Limiter Implementation Architecture**
+
+```mermaid
+graph TB
+    subgraph "Core Data Structures"
+        VISITOR_MAP["visitors map[string]*visitor"]
+        VISITOR_STRUCT["type visitor struct { limiter *rate.Limiter; lastSeen time.Time }"]
+        MUTEX["var mu sync.Mutex"]
+        RATE_LIMITER["rate.NewLimiter(rate.Limit(config.Rate), config.Burst)"]
+    end
+    
+    subgraph "Key Generation Functions"
+        USER_THROTTLE["func UserIdThrottleKey(ctx context.Context) (string, error)"]
+        IP_THROTTLE["func IpThrottleKey(ctx context.Context) (string, error)"]
+        USER_INFO["userinfo.FromContext(ctx).Id"]
+        CLIENT_IP["userinfo.GetClientIP(ctx)"]
+        THROTTLE_SKIP["return '', throttle.ErrSkip"]
+    end
+    
+    subgraph "Rate Limiting Logic"
+        GET_VISITOR["func getVisitor(key string, config RateLimiterConfig) *rate.Limiter"]
+        ALLOW_CHECK["limiter.Allow() bool"]
+        HTTP_429["http.StatusTooManyRequests"]
+        CLEANUP_GOROUTINE["func cleanupVisitors() - 3 minute TTL"]
+    end
+    
+    subgraph "Middleware Processing"
+        RATE_MIDDLEWARE["RateLimiterConfig.RateLimiterMiddleware"]
+        GET_METHOD_SKIP["if r.Method == 'GET' skip rate limiting"]
+        USER_FALLBACK["if user.Id == '' fallback to IP-based"]
+    end
+    
+    VISITOR_MAP --> VISITOR_STRUCT
+    VISITOR_STRUCT --> RATE_LIMITER
+    MUTEX --> VISITOR_MAP
+    
+    USER_THROTTLE --> USER_INFO
+    IP_THROTTLE --> CLIENT_IP
+    USER_INFO --> THROTTLE_SKIP
+    
+    GET_VISITOR --> VISITOR_MAP
+    GET_VISITOR --> ALLOW_CHECK
+    ALLOW_CHECK --> HTTP_429
+    
+    RATE_MIDDLEWARE --> GET_METHOD_SKIP
+    RATE_MIDDLEWARE --> USER_FALLBACK
+    GET_METHOD_SKIP --> GET_VISITOR
+    USER_FALLBACK --> GET_VISITOR
+    
+    CLEANUP_GOROUTINE --> VISITOR_MAP
+```
+
+**Rate Limiting Configuration and Behavior**
+
+| Configuration Field | Default Value | Purpose |
+|---------------------|---------------|---------|
+| `RateLimiterConfig.Enable` | `false` | Global rate limiting toggle |
+| `RateLimiterConfig.Rate` | `10` | Average requests per second |
+| `RateLimiterConfig.Burst` | `20` | Maximum burst capacity |
+
+**Rate Limiting Strategy**:
+1. **GET requests**: Excluded from rate limiting [rate-limiter.go:81-84]()
+2. **Authenticated users**: Rate limited by `userinfo.FromContext(ctx).Id` [rate-limiter.go:88-96]()
+3. **Unauthenticated users**: Rate limited by `userinfo.GetClientIP(ctx)` [rate-limiter.go:97-107]()
+4. **Cleanup mechanism**: `cleanupVisitors()` runs every minute, removing visitors inactive for >3 minutes [rate-limiter.go:56-68]()
+
+The system also integrates with `throttle.NewLimitCounter` for GraphQL-specific throttling using Redis backend [router.go:444-449]().
+
+Sources: [rate-limiter.go:12-134](), [router.go:521-533](), [router.go:444-449](), [rate-limiter.go:30-32]()
+
+## Redis Integration
+
+Redis is used for caching and session management with connection pooling and statistics tracking.
+
+```mermaid
+graph LR
+    subgraph "Redis Configuration"
+        REDIS_CONFIG["redis.Config"]
+        DIAL_OPTIONS["redis.DialOption[]"]
+        POOL_CONFIG["MaxIdle MaxActive IdleTimeout"]
+    end
+    
+    subgraph "Connection Pool"
+        REDIS_POOL["redis.Pool"]
+        DIAL_FUNC["Dial function"]
+        TLS_OPTION["redis.DialUseTLS()"]
+        AUTH_OPTION["redis.DialPassword()"]
+    end
+    
+    subgraph "Monitoring"
+        STATS_RECORDING["RecordStats()"]
+        OPEN_CONNECTIONS["MeasureOpenConnections"]
+        IDLE_CONNECTIONS["MeasureIdleConnections"]
+        WAIT_COUNT["MeasureWaitCount"]
+    end
+    
+    REDIS_CONFIG --> DIAL_OPTIONS
+    DIAL_OPTIONS --> TLS_OPTION
+    DIAL_OPTIONS --> AUTH_OPTION
+    
+    DIAL_FUNC --> REDIS_POOL
+    POOL_CONFIG --> REDIS_POOL
+    
+    REDIS_POOL --> STATS_RECORDING
+    STATS_RECORDING --> OPEN_CONNECTIONS
+    STATS_RECORDING --> IDLE_CONNECTIONS
+    STATS_RECORDING --> WAIT_COUNT
+```
+
+Sources: [redis/redis.go:20-88](), [redis/redis.go:139-170]()

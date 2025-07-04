@@ -1,0 +1,256 @@
+# Routing & Middleware
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [go.sum](go.sum)
+- [rate-limiter.go](rate-limiter.go)
+- [redis/redis.go](redis/redis.go)
+- [router.go](router.go)
+- [service_token.go](service_token.go)
+
+</details>
+
+
+
+This document covers the HTTP and gRPC routing system, middleware chain configuration, and request processing pipeline in the waqt-deployment service. The routing layer handles incoming requests through a comprehensive middleware stack that provides authentication, rate limiting, CORS, logging, and other cross-cutting concerns.
+
+For authentication mechanisms and access control details, see [Authentication & Authorization](#2.3). For GraphQL-specific routing and schema handling, see [GraphQL Gateway](#2.2).
+
+## Middleware Chain Architecture
+
+The application uses the Alice middleware library to create a composable chain of HTTP middleware components. The middleware chain is constructed in the `NewChain` function within the `RouterModule` fx.Options and processes all incoming HTTP requests in a specific order.
+
+**Alice Middleware Chain Construction in NewChain**
+```mermaid
+graph TD
+    REQUEST["Incoming HTTP Request"] --> RECOVERER["Recoverer"]
+    RECOVERER --> HEARTBEAT["middleware.Heartbeat(/_ah/health)"]
+    HEARTBEAT --> CORS["cors.New(cors.Options{}).Handler"]
+    CORS --> RATELIMIT["RateLimiterConfig.RateLimiterMiddleware"]
+    RATELIMIT --> COMPRESS["middleware.DefaultCompress (Optional)"]
+    COMPRESS --> LOGGER["in.Logger (alice.Constructor)"]
+    LOGGER --> JWT["in.Jwt (alice.Constructor)"]
+    JWT --> CLIENTIP["ClientIpFromHeaderMiddleware"]
+    CLIENTIP --> CAPTCHA["SetCaptchaResponseInContext"]
+    CAPTCHA --> GCAPTCHA["SetGoogleCaptchaResponseInContext"]
+    GCAPTCHA --> USERINFO["auth.UserInfoFromJwtMiddleware"]
+    USERINFO --> VERSION["version.Handler(Version)"]
+    VERSION --> SKIPRIGHT["graphql.SkipRightHeaderMiddleware"]
+    SKIPRIGHT --> APIKEY["ApiMiddleWareConfig.APIKeyMiddleware"]
+    APIKEY --> SERVICETOKEN["ServiceTokenMiddleWareConfig.ServiceTokenMiddleware"]
+    SERVICETOKEN --> EXTERNALJWT["in.ExternalJwt (alice.Constructor)"]
+    EXTERNALJWT --> ENFORCEAUTH["EnforceAuthenticationCheckMiddleware"]
+    ENFORCEAUTH --> ACTIVITY["TrackUserCompanyActivityLog"]
+    ACTIVITY --> OIDC["in.Oidc (alice.Constructor)"]
+    OIDC --> GRPCWEB["in.GrpcWeb (alice.Constructor)"]
+    GRPCWEB --> HANDLER["Application Handlers"]
+```
+
+The `RouterModule` uses fx dependency injection to configure all middleware components and their dependencies through `fx.Provide` functions including `NewChain`, `NewInterceptors`, `NewApiMiddlewareConfig`, and `NewServiceTokenMiddlewareConfig`.
+
+Sources: [router.go:62-98](), [router.go:100-163]()
+
+## HTTP Middleware Components
+
+### Core Infrastructure Middleware
+
+The infrastructure middleware provides essential request handling capabilities:
+
+| Middleware | Function | Purpose |
+|------------|----------|---------|
+| `Recoverer` | `Recoverer` | Panic recovery and error logging |
+| `Heartbeat` | `middleware.Heartbeat` | Health check endpoint at `/_ah/health` |
+| `DefaultCompress` | `middleware.DefaultCompress` | Response compression (configurable) |
+
+### Security and Authentication Middleware
+
+Multiple authentication methods are supported through dedicated middleware that populate `userinfo.UserInfo` context:
+
+**Authentication Flow and Context Population**
+```mermaid
+graph LR
+    subgraph "Authentication Middleware"
+        JWT["auth.UserInfoFromJwtMiddleware<br/>(Standard JWT)"]
+        APIKEY["ApiMiddleWareConfig.APIKeyMiddleware<br/>(X-API-KEY header)"] 
+        SERVICETOKEN["ServiceTokenMiddleWareConfig.ServiceTokenMiddleware<br/>(X-Service-Token header)"]
+        EXTERNALJWT["NewExternalJWtMiddleware<br/>(x-slug + token)"]
+    end
+    
+    subgraph "Context Enhancement"
+        USERINFO["userinfo.NewContext<br/>(UserInfo{Id, Email, TokenExpiry})"]
+        CLIENTIP["userinfo.NewContextWithClientIP<br/>(X-Forwarded-For extraction)"]
+        ACTIVITY["TrackUserCompanyActivityLog<br/>(Database + Cache)"]
+    end
+    
+    JWT --> USERINFO
+    APIKEY --> USERINFO
+    SERVICETOKEN --> USERINFO
+    EXTERNALJWT --> USERINFO
+    
+    USERINFO --> CLIENTIP
+    CLIENTIP --> ACTIVITY
+```
+
+#### Service Token Authentication Process
+
+The `ServiceTokenMiddleWareConfig` handles `X-Service-Token` header validation through a comprehensive validation pipeline:
+
+1. **Token Retrieval**: `serTokClient.GetServiceTokenByTokenValue()`
+2. **Activity Check**: Validates `IsActive` flag
+3. **Expiry Validation**: Checks `Expiry.Seconds` against current time  
+4. **Usage Tracking**: Updates `LastUsedOn` via `UpdateLastUsedOn()`
+5. **Context Population**: Creates `userinfo.UserInfo` with `IsServiceToken: true`
+
+Sources: [router.go:140-147](), [router.go:553-608](), [router.go:610-647](), [service_token.go:29-93]()
+
+### Request Processing Middleware
+
+Several middleware components enrich the request context:
+
+- **`ClientIpFromHeaderMiddleware`**: Extracts client IP from `X-Forwarded-For` header
+- **`SetCaptchaResponseInContext`**: Captures `X-Captcha-Response` header
+- **`SetGoogleCaptchaResponseInContext`**: Captures `g-recaptcha-response` header
+- **`EnforceAuthenticationCheckMiddleware`**: Enforces authentication on `/api` and `/graphql` endpoints
+
+Sources: [router.go:344-373](), [router.go:303-342]()
+
+## gRPC Interceptors
+
+The gRPC server uses a chain of unary interceptors constructed by `NewInterceptors` function for request processing:
+
+**gRPC Interceptor Chain ([]grpc.UnaryServerInterceptor)**
+```mermaid
+graph TD
+    GRPCREQ["gRPC Request"] --> RECOVERY["grpcrecovery.UnaryServerInterceptor()"]
+    RECOVERY --> GRPCJWT["in.Jwt (grpc.UnaryServerInterceptor)"]
+    GRPCJWT --> WRAPPER["in.GrpcWrapper (grpc.UnaryServerInterceptor)"]
+    WRAPPER --> GRPCUSER["auth.UserInfoFromJwtUnaryInterceptor(in.UserCli)"]
+    GRPCUSER --> GRPCIP["ClientIpInterceptor"]
+    GRPCIP --> GRPCVERSION["version.Interceptor(Version)"]
+    GRPCVERSION --> GRPCLOG["in.LogInterceptor (grpc.UnaryServerInterceptor)"]
+    GRPCLOG --> GRPCID["IdentifyGrpcCall"]
+    GRPCID --> GRPCHANDLER["Service Handler"]
+```
+
+Key interceptor implementations:
+- **`ClientIpInterceptor`**: Extracts client IP from `peer.FromContext()` and calls `userinfo.NewContextWithClientIP()`
+- **`IdentifyGrpcCall`**: Calls `userinfo.NewContextForGrpcCall()` to mark context as gRPC call
+- **`GrpcWrapper`**: Uses `grpcWrapper.ByPassFunc` with `graphql.SkipRightHeaderKey` detection
+
+The interceptor chain is constructed with fx dependency injection receiving `userPb.UserProfilesClient`, JWT interceptor, logger, and wrapper components.
+
+Sources: [router.go:388-406](), [router.go:375-386](), [router.go:383-386](), [router.go:75-82]()
+
+## CORS Configuration
+
+CORS handling supports both permissive and restrictive modes based on configuration:
+
+```mermaid
+graph TD
+    ORIGIN["Origin Header"] --> CORSCHECK{"CorsConfig.CorsConfig"}
+    CORSCHECK -->|true| VALIDATE["Validate Against Allowlist"]
+    CORSCHECK -->|false| ALLOW["Allow All Origins"]
+    
+    VALIDATE --> LOCALHOST{"Localhost Ports<br/>3000-3010, 6006-6016"}
+    VALIDATE --> REGEX{"appointy.com Regex<br/>^https://[a-z0-9A-Z.-]+.appointy.com"}
+    
+    LOCALHOST -->|match| ALLOW
+    REGEX -->|match| ALLOW
+    LOCALHOST -->|no match| DENY["Deny Origin"]
+    REGEX -->|no match| DENY
+```
+
+The `CheckCors` function validates origins against:
+- Development localhost ports (3000-3010, 6006-6016)
+- Production appointy.com subdomains via regex pattern
+
+Sources: [router.go:254-301](), [router.go:124-131]()
+
+## Rate Limiting System
+
+The rate limiting system operates on both user ID and IP address with in-memory tracking using `golang.org/x/time/rate` package:
+
+**Rate Limiting Decision Flow**
+```mermaid
+graph LR
+    subgraph "Rate Limiter Components"
+        CONFIG["RateLimiterConfig<br/>{Enable, Rate, Burst}"]
+        VISITORS["var visitors map[string]*visitor"]
+        CLEANUP["cleanupVisitors() goroutine"]
+        VISITOR["visitor{limiter, lastSeen}"]
+    end
+    
+    subgraph "RateLimiterMiddleware Processing"
+        REQUEST["HTTP Request"] --> ENABLED{"config.Enable?"}
+        ENABLED -->|false| BYPASS["Bypass Rate Limit"]
+        ENABLED -->|true| GETMETHOD{"r.Method == GET?"}
+        GETMETHOD -->|yes| BYPASS
+        GETMETHOD -->|no| USERID{"userinfo.FromContext().Id != ''?"}
+        USERID -->|yes| USERLIMIT["getVisitor(userId, config)"]
+        USERID -->|no| IPLIMIT["getVisitor(userinfo.GetClientIP(), config)"]
+    end
+    
+    USERLIMIT --> RATECHECK["rate.NewLimiter(rate.Limit(Rate), Burst).Allow()"]
+    IPLIMIT --> RATECHECK
+    RATECHECK -->|false| REJECT["http.Error(w, StatusTooManyRequests)"]
+    RATECHECK -->|true| CONTINUE["userinfo.NewContext(userInfo)"]
+```
+
+**Rate Limiter Implementation Details**:
+- **Visitor tracking**: Global `visitors map[string]*visitor` with `sync.Mutex`
+- **Limiter creation**: `rate.NewLimiter(rate.Limit(config.Rate), config.Burst)` per visitor
+- **Cleanup process**: Background goroutine removes visitors inactive for >3 minutes
+- **Configuration loading**: `NewConfig()` loads from config loader with defaults `{Enable: false, Rate: 10, Burst: 20}`
+
+Sources: [rate-limiter.go:78-120](), [rate-limiter.go:20-52](), [rate-limiter.go:56-68](), [rate-limiter.go:122-134]()
+
+## User Activity Tracking
+
+The `TrackUserCompanyActivityLog` middleware tracks user activity timestamps with caching optimization:
+
+```mermaid
+graph TD
+    ACTREQ["Request with Query Params"] --> PARAMS{"userId, groupId,<br/>companyId present?"}
+    PARAMS -->|no| SKIP["Skip Tracking"]
+    PARAMS -->|yes| CACHEKEY["Generate Cache Key<br/>userId-groupId/companyId"]
+    
+    CACHEKEY --> CACHECHECK["cache.Get(cacheKey)"]
+    CACHECHECK -->|hit| TIMEDIFF{"Time Diff < 1 hour?"}
+    CACHECHECK -->|miss| DBINSERT["insertValInDB()"]
+    
+    TIMEDIFF -->|yes| SKIP
+    TIMEDIFF -->|no| DBINSERT
+    
+    DBINSERT --> DBCHECK["Check DB for existing record"]
+    DBCHECK -->|not found| NEWRECORD["INSERT new record"]
+    DBCHECK -->|found| HOURCHECK{"Last activity < 1 hour ago?"}
+    
+    HOURCHECK -->|yes| SKIP
+    HOURCHECK -->|no| UPDATE["UPDATE last_activity_on"]
+    
+    NEWRECORD --> CACHESET["cache.Set(cacheKey, timestamp)"]
+    UPDATE --> CACHESET
+```
+
+Features:
+- **Hourly granularity**: Only updates if last activity was over 1 hour ago
+- **Cache optimization**: 90-minute cache expiry to reduce database load
+- **Database fallback**: Updates `user_company_activity_logs` table when cache misses
+
+Sources: [router.go:165-252]()
+
+## Configuration System
+
+The routing system uses multiple configuration structures loaded via the config loader:
+
+| Configuration | Type | Purpose |
+|---------------|------|---------|
+| `RateLimiterConfig` | Rate limiting | Enable/disable, rate limits, burst capacity |
+| `CorsLimiterConfig` | CORS policy | Restrictive vs permissive CORS |
+| `TimeoutConfig` | Request timeouts | Default and custom query timeouts |
+| `RecursiveDepthConfig` | GraphQL limits | Maximum query depth limits |
+
+Sources: [router.go:408-431](), [router.go:654-683](), [rate-limiter.go:122-134]()

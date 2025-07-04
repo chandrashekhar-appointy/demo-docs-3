@@ -1,0 +1,396 @@
+# Role-Based Access Control
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [Dockerfile](Dockerfile)
+- [displayModuleRoles.json](displayModuleRoles.json)
+- [roles/go.mod](roles/go.mod)
+- [roles/roles.go](roles/roles.go)
+
+</details>
+
+
+
+This document describes the hierarchical role-based access control (RBAC) system that governs user permissions throughout the Waqt deployment system. The system provides fine-grained access control through a combination of default organizational roles and granular module-specific permissions.
+
+For information about the authentication middleware that enforces these permissions, see [Authentication Middleware](#5.2). For details about the broader security architecture, see [Security & Access Control](#5).
+
+## Role Hierarchy System
+
+The RBAC system operates on a multi-level organizational hierarchy with roles scoped to different organizational levels. The system supports inheritance where higher-level roles automatically include permissions from lower levels.
+
+```mermaid
+graph TD
+    subgraph "Organizational Hierarchy"
+        GRP["grp (Group Level)<br/>Highest organizational scope"]
+        COM["com (Company Level)<br/>Individual business entities"]
+        LOC["loc (Location Level)<br/>Physical or logical locations"]
+        EMP["emp (Employee Level)<br/>Individual staff members"]
+        USR["usr (User Level)<br/>General authenticated users"]
+        CUST["cust (Customer Level)<br/>External customers"]
+    end
+    
+    subgraph "Default Roles"
+        OWNER["Owner<br/>Priority: 1<br/>Level: grp"]
+        COOWNER["Co-Owner<br/>Priority: 2<br/>Level: grp"] 
+        GROUPADMIN["Group Admin<br/>Priority: 3<br/>Level: grp"]
+        COMPANYADMIN["Company Admin<br/>Priority: 5<br/>Level: com"]
+        LOCATIONADMIN["Location Admin<br/>Priority: 7<br/>Level: loc"]
+        STAFF["Staff<br/>Priority: 0<br/>Level: emp"]
+        USER["User<br/>Priority: 0<br/>Level: usr"]
+        CUSTOMER["Customer<br/>Priority: 0<br/>Level: cust"]
+    end
+    
+    GRP --> COM
+    COM --> LOC
+    LOC --> EMP
+    
+    OWNER -.-> GRP
+    COOWNER -.-> GRP
+    GROUPADMIN -.-> GRP
+    COMPANYADMIN -.-> COM
+    LOCATIONADMIN -.-> LOC
+    STAFF -.-> EMP
+    USER -.-> USR
+    CUSTOMER -.-> CUST
+```
+
+**Sources:** [roles/roles.go:32-216](), [module_parents.json:1-471]()
+
+## Module Role Architecture
+
+The system implements a comprehensive module role system where specific permissions are granted through `ModuleRoleName` arrays. Each role contains multiple module-specific permissions that control access to different functional areas.
+
+```mermaid
+graph LR
+    subgraph "Role Definition Structure"
+        ROLE["DefaultRoles Array<br/>roles/roles.go"]
+        ROLENAME["RoleName: 'Owner'"]
+        ROLESLUG["RoleSlug: 'Owner'"]
+        LEVEL["Level: 'grp'"]
+        MODULEROLES["ModuleRoleName: []string"]
+        PRIORITY["Priority: 1"]
+    end
+    
+    subgraph "Module Permissions"
+        GROUPLEVEL["GroupLevel"]
+        APPTADMIN["AppointmentsAdminSettingsSkip"]
+        AVAILADMIN["AvailabilityAdminSettingsSkip"]
+        MARKETING["AppointmentsMarketingStatusViewer"]
+        NOTES["AppointmentsAllStaffNotesViewAccess"]
+        PRIVATE["AppointmentsPrivateNotesAccess"]
+        CUSTOMERS["CustomersContactViewer"]
+        GIFTCARD["GiftCertificateWalletsCodeViewer"]
+    end
+    
+    ROLE --> ROLENAME
+    ROLE --> ROLESLUG
+    ROLE --> LEVEL
+    ROLE --> MODULEROLES
+    ROLE --> PRIORITY
+    
+    MODULEROLES --> GROUPLEVEL
+    MODULEROLES --> APPTADMIN
+    MODULEROLES --> AVAILADMIN
+    MODULEROLES --> MARKETING
+    MODULEROLES --> NOTES
+    MODULEROLES --> PRIVATE
+    MODULEROLES --> CUSTOMERS
+    MODULEROLES --> GIFTCARD
+```
+
+**Sources:** [roles/roles.go:32-49]()
+
+## Display Module Roles Configuration
+
+The `displayModuleRoles.json` file defines a comprehensive permission matrix with 25 application modules and hierarchical role relationships. Each display module role aggregates multiple fine-grained module permissions and supports inheritance through parent-child relationships.
+
+### Application Module Overview
+
+| Application | Top-Level Role | Priority | Level | Module Roles Count |
+|-------------|---------------|----------|-------|-------------------|
+| Appointments | Full access to appointments | 1 | all | 30 |
+| Customers | Full access to customers | 1 | all | 12 |
+| OpenHours | Complete access to open hours | 1 | all | 4 |
+| BlockHours | Complete access to block hours | 1 | all | 3 |
+| Resources | Full access to resource types | 1 | com | 5 |
+| Services | Full access to services | 1 | all | 20 |
+| ServiceTemplates | Full access to service templates | 1 | com | 3 |
+| Certificates | Certificates Admin | 1 | com | 1 |
+| Marketplace | Apps Full access | 1 | all | 5 |
+| Masters | Full access to masters | 1 | all | 6 |
+| Employees | Full access to employees | 1 | all | 15 |
+| Companies | Viewer access to companies | 1 | com | 1 |
+| Roles N Rights | Full access to roles | 1 | com | 1 |
+| Reviews | Full Access to Reviews | 1 | com | 4 |
+| Billing | Full access to billing | 1 | com | 5 |
+| Reports | Full access to all reports | 1 | all | 5 |
+| DiscountCoupons | Full access to discount coupons | 1 | all | 8 |
+| GiftCards | Full access to gift cards | 1 | all | 7 |
+| Memberships | Full access to memberships | 1 | all | 6 |
+| Locations | Full access to location | 1 | all | 6 |
+| NotificationsApp | Complete access to notification templates | 1 | all | 6 |
+| LinkSharing | Full access to link sharing app | 1 | all | 5 |
+| Meetings | Full access to meetings calendar | 1 | com | 19 |
+| Sitback | Full access to customer staff linking | 1 | all | 2 |
+| Tier Allocation | Full access to Tier Allocation | 1 | all | 2 |
+
+### Display Module Role Data Structure
+
+```mermaid
+graph TD
+    subgraph "displayModuleRoles.json Structure"
+        DMR_FILE["displayModuleRoles.json<br/>1322 lines"]
+        DATA_ARRAY["data: []<br/>Root array container"]
+        DMR_ENTRY["Display Module Role Entry"]
+    end
+    
+    subgraph "DMR Entry Fields"
+        ID["Id: 'dmr_01E9ZEDJ3WCX34NXRK03YZVJQW'"]
+        APP_NAME["App_name: 'Appointments'"]
+        DESCRIPTION["Description: 'Full access to all appointments...'"]
+        NAME["Name: 'Full access to appointments'"]
+        MODULE_ROLES["Module_roles: [array of permissions]"]
+        PRIORITY["Priority: 1"]
+        PARENT["Parent: '' or parent_id"]
+        LEVEL["Level: 'all'|'com'|'loc'|'emp'|'usr'|'cust'"]
+    end
+    
+    subgraph "Example Module Roles Array"
+        APPT_ADMIN["AppointmentsAdmin"]
+        SERVICE_ADMIN["ServiceSettingsAdmin"]
+        EMPLOYEE_VIEWER["EmployeesViewer"]
+        ORDERS_ADMIN["OrdersAdmin"]
+        NOTES_EDITOR["AppointmentsNotesEditor"]
+    end
+    
+    DMR_FILE --> DATA_ARRAY
+    DATA_ARRAY --> DMR_ENTRY
+    DMR_ENTRY --> ID
+    DMR_ENTRY --> APP_NAME
+    DMR_ENTRY --> DESCRIPTION
+    DMR_ENTRY --> NAME
+    DMR_ENTRY --> MODULE_ROLES
+    DMR_ENTRY --> PRIORITY
+    DMR_ENTRY --> PARENT
+    DMR_ENTRY --> LEVEL
+    
+    MODULE_ROLES --> APPT_ADMIN
+    MODULE_ROLES --> SERVICE_ADMIN
+    MODULE_ROLES --> EMPLOYEE_VIEWER
+    MODULE_ROLES --> ORDERS_ADMIN
+    MODULE_ROLES --> NOTES_EDITOR
+```
+
+### Hierarchical Role Relationships
+
+The system supports multi-level inheritance where child roles inherit permissions from parents while adding specific restrictions or modifications.
+
+```mermaid
+graph TD
+    subgraph "Appointments Module Hierarchy"
+        APPT_FULL["dmr_01E9ZEDJ3WCX34NXRK03YZVJQW<br/>Full access to appointments<br/>Priority: 1<br/>Parent: ''"]
+        APPT_EDIT["dmr_01FS6J2FZGT5WDQ7DYFD8HBK4G<br/>Full access + view settings<br/>Priority: 2<br/>Parent: dmr_01E9ZEDJ3WCX34NXRK03YZVJQW"]
+        APPT_VIEW["dmr_01F6HDMT4P2VXWC0W08E69SWJY<br/>View access to appointments<br/>Priority: 3<br/>Parent: dmr_01FS6J2FZGT5WDQ7DYFD8HBK4G"]
+    end
+    
+    subgraph "Customers Module Hierarchy"
+        CUST_FULL["dmr_01E9ZEDJ3XCFY07KCCAD9GD8TY<br/>Full access to customers<br/>Priority: 1<br/>Parent: ''"]
+        CUST_EDIT["dmr_01E9ZEDJ3XCFY07KCCAD9GDTTT<br/>Can edit customers<br/>Priority: 2<br/>Parent: dmr_01E9ZEDJ3XCFY07KCCAD9GD8TY"]
+        CUST_STATS["dmr_01E9ZEDJ3XQESG12PPVM7BBBBP<br/>Can view customer stats<br/>Priority: 3<br/>Parent: dmr_01E9ZEDJ3XCFY07KCCAD9GD8TY"]
+        CUST_CONTACT["dmr_01E9ZEDJ3XCFY07KCCAH96HBJ3<br/>Can view customer contact info<br/>Priority: 5<br/>Parent: dmr_01E9ZEDJ3XCFY07KCCAD9GD8TY"]
+        CUST_NOTES["dmr_01E9ZEDJ3XQESG12PPVM7BBBEE<br/>Can edit private notes<br/>Priority: 6<br/>Parent: dmr_01E9ZEDJ3XCFY07KCCAD9GD8TY"]
+        CUST_VIEW["dmr_01E9ZEDJ3XQESG12PPVM7BABEE<br/>Can view customers<br/>Priority: 6<br/>Parent: dmr_01E9ZEDJ3XCFY07KCCAD9GD8TY"]
+    end
+    
+    APPT_FULL --> APPT_EDIT
+    APPT_EDIT --> APPT_VIEW
+    
+    CUST_FULL --> CUST_EDIT
+    CUST_FULL --> CUST_STATS
+    CUST_FULL --> CUST_CONTACT
+    CUST_FULL --> CUST_NOTES
+    CUST_FULL --> CUST_VIEW
+```
+
+**Sources:** [displayModuleRoles.json:1-1322](), [Dockerfile:20]()
+
+## Permission Levels and Access Scopes
+
+The RBAC system defines access control through level-based scoping where each role and module permission is constrained to specific organizational levels. The system supports six primary access levels with implicit inheritance.
+
+### Access Level Definitions
+
+| Level | Scope | Description |
+|-------|-------|-------------|
+| `all` | Universal | Access across all organizational levels |
+| `grp` | Group | Highest organizational scope, multi-company access |
+| `com` | Company | Individual business entity scope |
+| `loc` | Location | Physical or logical location scope |
+| `emp` | Employee | Individual staff member scope |
+| `usr` | User | General authenticated user scope |
+| `cust` | Customer | External customer scope |
+
+### Module Level Distribution
+
+```mermaid
+graph TD
+    subgraph "Level Distribution in displayModuleRoles.json"
+        ALL_LEVEL["Level: 'all'<br/>Appointments, Customers, Services<br/>Employees, Reports, etc."]
+        COM_LEVEL["Level: 'com'<br/>Resources, ServiceTemplates<br/>Certificates, Masters, etc."]
+        LOC_LEVEL["Level: 'loc'<br/>Reviews (location-specific)"]
+        EMP_LEVEL["Level: 'emp'<br/>Staff-specific permissions"]
+        USR_LEVEL["Level: 'usr'<br/>General user permissions"]
+        CUST_LEVEL["Level: 'cust'<br/>Customer-specific permissions"]
+    end
+    
+    subgraph "Permission Inheritance Flow"
+        INHERIT_ALL["all → grp → com → loc → emp"]
+        INHERIT_USER["usr (independent)"]
+        INHERIT_CUST["cust (independent)"]
+    end
+    
+    ALL_LEVEL --> INHERIT_ALL
+    COM_LEVEL --> INHERIT_ALL
+    LOC_LEVEL --> INHERIT_ALL
+    EMP_LEVEL --> INHERIT_ALL
+    USR_LEVEL --> INHERIT_USER
+    CUST_LEVEL --> INHERIT_CUST
+```
+
+### Module-Specific Level Examples
+
+```mermaid
+graph LR
+    subgraph "Resource Management (Company-Level)"
+        RESOURCE_ADMIN["dmr_01E9ZEDJ3XQESG12PPVJ32KVQA<br/>Full access to resource types<br/>Level: com"]
+        RESOURCE_VIEW["dmr_01E9ZEDJ3XQESG12PPVJ3EYGTE<br/>View Resources<br/>Level: com"]
+    end
+    
+    subgraph "Appointment Management (All-Level)"
+        APPT_ADMIN["dmr_01E9ZEDJ3WCX34NXRK03YZVJQW<br/>Full access to appointments<br/>Level: all"]
+        APPT_VIEW["dmr_01F6HDMT4P2VXWC0W08E69SWJY<br/>View access to appointments<br/>Level: all"]
+    end
+    
+    subgraph "Reviews (Location-Level)"
+        REVIEW_LOC["dmr_01EKHS0YQ9Q9W135SCP3WM2ZC8<br/>Full Access to Reviews<br/>Level: loc"]
+    end
+    
+    RESOURCE_ADMIN --> RESOURCE_VIEW
+    APPT_ADMIN --> APPT_VIEW
+```
+
+**Sources:** [displayModuleRoles.json:34](), [displayModuleRoles.json:100](), [displayModuleRoles.json:247](), [displayModuleRoles.json:832-840]()
+
+## Default Role Definitions
+
+The system provides a comprehensive set of default roles with specific module permissions. Each role is assigned a priority that determines precedence in permission resolution, with lower numbers indicating higher priority.
+
+### Administrative Roles
+
+| Role Name | Level | Priority | Key Module Roles |
+|-----------|-------|----------|------------------|
+| Owner | grp | 1 | GroupLevel, AppointmentsAdminSettingsSkip, CustomersContactViewer |
+| Co-Owner | grp | 2 | GroupLevel, AppointmentsAdminSettingsSkip, CustomersContactViewer |
+| Group Admin | grp | 3 | GroupLevel, AppointmentsAdminSettingsSkip, CustomersContactViewer |
+| Company Admin | com | 5 | CompanyLevel, AppointmentsAdminSettingsSkip, CustomersContactViewer |
+| Location Admin | loc | 7 | LocationLevel, AppointmentsAdminSettingsSkip, CustomersContactViewer |
+
+### Operational Roles
+
+| Role Name | Level | Priority | Key Module Roles |
+|-----------|-------|----------|------------------|
+| Staff | emp | 0 | ServiceProviderLevel, AppointmentsReportViewer, NotesPrivateAccess |
+| User | usr | 0 | UserLevel |
+| Customer | cust | 0 | CustomerLevel |
+
+```mermaid
+graph TD
+    subgraph "GetDefaultRoles Function"
+        GETDEFAULT["GetDefaultRoles()<br/>roles/roles.go:28-30"]
+        DEFAULTROLES["DefaultRoles Variable<br/>roles/roles.go:32"]
+        ROLESARRAY["[]*ssRoles.Roles Array"]
+    end
+    
+    subgraph "Role Structure Fields"
+        ROLENAME["RoleName: string"]
+        ROLESLUG["RoleSlug: string"] 
+        LEVEL["Level: string"]
+        MODULEROLE["ModuleRoleName: []string"]
+        PRIORITY["Priority: int"]
+    end
+    
+    subgraph "Module Role Examples"
+        GROUPLEVEL["'GroupLevel'"]
+        SETTINGSSKIP["'AppointmentsAdminSettingsSkip'"]
+        NOTESACCESS["'NotesPrivateAccess'"]
+        CONTACTVIEWER["'CustomersContactViewer'"]
+    end
+    
+    GETDEFAULT --> DEFAULTROLES
+    DEFAULTROLES --> ROLESARRAY
+    
+    ROLESARRAY --> ROLENAME
+    ROLESARRAY --> ROLESLUG
+    ROLESARRAY --> LEVEL
+    ROLESARRAY --> MODULEROLE
+    ROLESARRAY --> PRIORITY
+    
+    MODULEROLE --> GROUPLEVEL
+    MODULEROLE --> SETTINGSSKIP
+    MODULEROLE --> NOTESACCESS
+    MODULEROLE --> CONTACTVIEWER
+```
+
+**Sources:** [roles/roles.go:28-30](), [roles/roles.go:32-216]()
+
+## User Role Configuration
+
+The system includes a configurable user role system that can be customized through environment configuration. This allows for flexible role assignment and management across different deployment environments.
+
+```mermaid
+graph LR
+    subgraph "User Role Configuration"
+        NEWUSERROLE["NewUserRoleConfig Function<br/>roles/roles.go:14-26"]
+        CONFIGLOADER["config.Loader Parameter"]
+        DEFAULTCONFIG["Default UserRoleConfig"]
+        ENVLOAD["Environment Loading"]
+    end
+    
+    subgraph "UserRoleConfig Structure"
+        USERROLEKEY["UserRoleKey: 'uro_userRole'"]
+        USERROLEID["UserRoleRoleId: 'rol_01DT...'"]  
+        ROLEID["UserRoleId: '004_userRole'"]
+    end
+    
+    subgraph "Configuration Loading"
+        LOADFUNC["loader.Load('userrole', &def)"]
+        ERRORHANDLE["Error Handling"]
+        RETURNCONFIG["Return UserRoleConfig"]
+    end
+    
+    NEWUSERROLE --> CONFIGLOADER
+    NEWUSERROLE --> DEFAULTCONFIG
+    NEWUSERROLE --> ENVLOAD
+    
+    DEFAULTCONFIG --> USERROLEKEY
+    DEFAULTCONFIG --> USERROLEID
+    DEFAULTCONFIG --> ROLEID
+    
+    ENVLOAD --> LOADFUNC
+    LOADFUNC --> ERRORHANDLE
+    LOADFUNC --> RETURNCONFIG
+```
+
+**Sources:** [roles/roles.go:14-26]()
+
+## Integration with Authentication System
+
+The role-based access control system integrates with the broader authentication architecture through dependency injection and module configuration. The system is designed to work seamlessly with JWT tokens, service tokens, and API key authentication methods.
+
+The roles module exports its configuration through the `Module` variable, which uses Uber FX dependency injection to provide `GetDefaultRoles` and `NewUserRoleConfig` functions to the rest of the application.
+
+**Sources:** [roles/roles.go:9-12](), [roles/go.mod:1-14]()

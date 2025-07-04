@@ -1,0 +1,325 @@
+# GraphQL API
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [graphql.go](graphql.go)
+- [subscriptions.go](subscriptions.go)
+- [verify.go](verify.go)
+
+</details>
+
+
+
+This document covers the GraphQL API layer, detailing schema registration, subscription handling, and query resolution mechanisms. The GraphQL API serves as a unified gateway that aggregates data from multiple business domain services and provides real-time subscriptions for appointment booking, notifications, and calendar events.
+
+For information about the underlying gRPC services that power this GraphQL layer, see [gRPC Services](#4.2). For details about HTTP routing and middleware, see [HTTP Endpoints](#4.3).
+
+## Schema Registration System
+
+The GraphQL schema registration follows a modular dependency injection pattern using Uber FX, allowing services to register their GraphQL resolvers independently through the `graphql-service` group.
+
+```mermaid
+graph TD
+    FX_APP["fx.App"] --> INVOKE_GRAPHQL["InvokeGraphQLServices"]
+    INVOKE_GRAPHQL --> CONFIG_CHECK["ExposureConfig.Graphql"]
+    CONFIG_CHECK --> TIMEOUT_TEST["RegisterGqlTimeoutTest(Schema)"]
+    CONFIG_CHECK --> REGISTER_LOOP["GraphQLRegister function loop"]
+    
+    REGISTER_LOOP --> SCHEMA_FUNC["f(Schema)"]
+    SCHEMA_FUNC --> JAAL_SCHEMA["schemabuilder.Schema"]
+    
+    subgraph "RegisterGraphqlSchemasIn Dependencies"
+        LOG["*zap.Logger"]
+        CONFIG["ExposureConfig"]
+        SCHEMA["*schemabuilder.Schema"]
+        GRAPHQL_REGISTER["[]func(s *schemabuilder.Schema)"]
+    end
+    
+    FX_IN["fx.In"] --> LOG
+    FX_IN --> CONFIG
+    FX_IN --> SCHEMA
+    FX_IN --> GRAPHQL_REGISTER
+```
+
+The registration process is controlled by the `InvokeGraphQLServices` fx.Invoke function, which conditionally enables GraphQL based on `ExposureConfig.Graphql` and iterates through all functions in the `graphql-service` group.
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `RegisterGraphqlSchemasIn` | Struct | FX dependency container for GraphQL registration |
+| `GraphQLRegister` | `[]func(s *schemabuilder.Schema)` | Array of schema registration functions |
+| `ExposureConfig.Graphql` | Boolean | Feature flag for GraphQL enablement |
+| `schemabuilder.Schema` | Jaal schema builder | Core GraphQL schema construction |
+
+**Sources:** [graphql.go:9-28]()
+
+## DataLoader Architecture
+
+The system implements extensive DataLoader patterns to solve the N+1 query problem and optimize database access through batching. Each DataLoader is configured with specific batching parameters and caching policies.
+
+### DataLoader Configuration Pattern
+
+```mermaid
+graph LR
+    BATCH_FUNC["Batch Function"] --> DATALOADER["dataloader.NewBatchedLoader"]
+    DATALOADER --> CONFIG_OPTIONS["Configuration Options"]
+    
+    CONFIG_OPTIONS --> NO_CACHE["dataloader.WithCache(&dataloader.NoCache{})"]
+    CONFIG_OPTIONS --> WAIT_TIME["dataloader.WithWait(70*time.Millisecond)"]
+    CONFIG_OPTIONS --> INPUT_CAP["dataloader.WithInputCapacity(5000)"]
+    CONFIG_OPTIONS --> BATCH_CAP["dataloader.WithBatchCapacity(1000)"]
+```
+
+| DataLoader | Batch Capacity | Wait Time | Input Capacity | Caching |
+|------------|---------------|-----------|----------------|---------|
+| `customerLoader` | Default | 70ms | 5000 | NoCache |
+| `employeeLoader` | 1000 | 70ms | 5000 | NoCache |
+| `serviceLoader` | Default | 70ms | 5000 | NoCache |
+| `orderLoader` | Default | Default | Default | NoCache |
+| `categoryLoader` | Default | Default | Default | NoCache |
+
+**Sources:** [connections.go:156-172](), [connections.go:442-478](), [connections.go:426-441]()
+
+## Connection Patterns
+
+The GraphQL API implements sophisticated connection patterns that bridge appointment system entities with their underlying microservice data sources.
+
+### Core Entity Connections
+
+```mermaid
+graph TD
+    APPOINTMENT["Appointment"] --> CUSTOMER_CONN["AppointmentConsumer"]
+    APPOINTMENT --> SERVICE_CONN["AppointmentService"] 
+    APPOINTMENT --> EMPLOYEE_CONN["AppointmentEmployee"]
+    APPOINTMENT --> RESOURCE_CONN["AppointmentResource"]
+    APPOINTMENT --> CHANNEL_CONN["AppointmentChannel"]
+    
+    CUSTOMER_CONN --> CUSTOMER_UNION["ConsumerTypesUnion"]
+    CUSTOMER_UNION --> CUSTOMER["Customer"]
+    CUSTOMER_UNION --> STUDENT["Student"]
+    
+    SERVICE_CONN --> SERVICE_ORIG["Service.original"]
+    EMPLOYEE_CONN --> EMPLOYEE_ORIG["Employee.original"]
+    RESOURCE_CONN --> RESOURCE_ORIG["Resource.original"]
+    
+    SERVICE_ORIG --> SERVICE_PB["servicepb.Service"]
+    EMPLOYEE_ORIG --> EMPLOYEE_PB["employeepb.Employee"]
+    RESOURCE_ORIG --> RESOURCE_PB["resourcepb.Resource"]
+```
+
+Each connection type provides both wrapper objects and access to the original underlying protobuf entities through `original` field resolvers.
+
+**Sources:** [connections.go:1471-1518](), [connections.go:1520-1547](), [connections.go:1549-1576]()
+
+## GraphQL Subscriptions
+
+The GraphQL API implements real-time subscriptions for critical business events using protobuf-based message passing and filtering logic. Subscriptions provide live updates for appointments, notifications, and calendar changes.
+
+### Subscription Architecture
+
+```mermaid
+graph TD
+    CLIENT["GraphQL Client"] --> SUBSCRIPTION["schemabuilder.Subscription"]
+    SUBSCRIPTION --> PAYLOAD["Subscription Payload"]
+    PAYLOAD --> UNMARSHAL["proto.Unmarshal"]
+    
+    UNMARSHAL --> FILTER_LOGIC["Filtering Logic"]
+    FILTER_LOGIC --> HANDLER_CALL["Service Handler Call"]
+    
+    subgraph "Subscription Types"
+        APPOINTMENTS["appointments subscription"]
+        NOTIFICATIONS["notifications subscription"] 
+        BLOCK_HOURS["blockHours subscription"]
+        SHIVAM["shivam subscription"]
+    end
+    
+    HANDLER_CALL --> APPT_HANDLER["appointment.SubscriptionHandler"]
+    HANDLER_CALL --> NOTIF_HANDLER["notification.SubscriptionHandler"]
+    HANDLER_CALL --> BLOCK_HANDLER["blockHour.SubscriptionHandler"]
+```
+
+### Appointments Subscription
+
+The appointments subscription provides real-time updates for appointment changes with comprehensive filtering capabilities:
+
+| Filter Parameter | Type | Purpose |
+|-----------------|------|---------|
+| `Parents` | `[]string` | Filter by organizational hierarchy |
+| `EmployeeIds` | `[]string` | Filter by specific employees |
+| `ServiceIds` | `[]string` | Filter by service types |
+| `ResourceIds` | `[]string` | Filter by resources |
+| `ResourceTypeIds` | `[]string` | Filter by resource categories |
+| `StartTime` | `schemabuilder.Timestamp` | Time range start |
+| `EndTime` | `schemabuilder.Timestamp` | Time range end |
+
+The subscription unmarshals `aptPb.Appointment` protobuf messages and applies filtering logic before delegating to `appointment.SubscriptionHandler`.
+
+**Sources:** [subscriptions.go:46-89]()
+
+### Notifications Subscription  
+
+The notifications subscription handles real-time web notification delivery:
+
+```mermaid
+graph LR
+    WEB_NOTIFICATION["webPb.WebNotification"] --> UNMARSHAL_NOTIF["proto.Unmarshal"]
+    UNMARSHAL_NOTIF --> USER_FILTER["UserId Filter Check"] 
+    USER_FILTER --> NOTIF_HANDLER["notification.SubscriptionHandler"]
+    
+    subgraph "Notification Filters"
+        USER_ID["UserId"]
+        LOCALE["Locale"]
+        EVENT_TYPE["EventType"]
+        STATUS_TYPE["NotificationStatusType"]
+    end
+```
+
+The notification subscription filters messages by `UserId` to ensure users only receive their own notifications.
+
+**Sources:** [subscriptions.go:91-118]()
+
+### Block Hours Subscription
+
+The block hours subscription provides real-time updates for calendar availability changes:
+
+| Filter | Description |
+|--------|-------------|
+| `Parents` | Organizational hierarchy filtering |
+| `EmployeeIds` | Specific employee availability |  
+| `ResourceIds` | Resource-specific blocks |
+| `Sources` | Block hour sources |
+| `ExternalSourceIds` | External calendar integration IDs |
+
+The subscription processes `blockPb.BlockHourRule` messages and applies multiple levels of filtering before calling `blockHour.SubscriptionHandler`.
+
+**Sources:** [subscriptions.go:120-167]()
+
+### Cross-Service Resolution
+
+The system resolves related entities across different microservices through DataLoader-backed field functions:
+
+```mermaid
+graph LR
+    APPOINTMENT_ENTITY["Appointment Entity"] --> NOTE_FIELD["note field"]
+    APPOINTMENT_ENTITY --> ORDERS_FIELD["orders field"]
+    APPOINTMENT_ENTITY --> SUBMISSIONS_FIELD["submissions field"]
+    
+    NOTE_FIELD --> NOTES_LOADER["notesLoader"]
+    ORDERS_FIELD --> ORDERS_LOADER["ordersByItemIdLoader"]
+    SUBMISSIONS_FIELD --> FORM_LOADER["ifSubmissionByAgainstLoader"]
+    
+    NOTES_LOADER --> NOTES_SERVICE["notepb.NotesClient"]
+    ORDERS_LOADER --> ORDER_SERVICE["orderpb.OrdersClient"] 
+    FORM_LOADER --> FORM_SERVICE["formPb.IntakeFormSubmissionsClient"]
+```
+
+**Sources:** [connections.go:1190-1212](), [connections.go:1293-1312](), [connections.go:1313-1332]()
+
+## Localization Support
+
+The GraphQL API provides comprehensive localization support through specialized locale-aware DataLoaders and field resolvers.
+
+### Locale-Aware Field Resolution
+
+```mermaid
+graph TD
+    SERVICE_TITLE["Service.title(locale)"] --> LOCALE_CHECK["Locale Parameter Check"]
+    LOCALE_CHECK --> SERVICE_LOCALE_LOADER["serviceLocaleLoader"]
+    SERVICE_LOCALE_LOADER --> BATCH_REQUEST["BatchGetServiceByIdLocale"]
+    BATCH_REQUEST --> LOCALE_DATA["ServiceLocale Response"]
+    LOCALE_DATA --> FALLBACK["Fallback to Default Title"]
+    
+    CATEGORY_NAME["Category.name(locale)"] --> CAT_LOCALE_LOADER["categoryLocaleLoader"]
+    COMPANY_ALIASES["CompanySetting.aliases(locale)"] --> COMPANY_LOCALE_LOADER["companySettingLocaleLoader"]
+```
+
+The localization system supports multiple entity types including Services, Categories, ServiceTemplates, and CompanySettings, with automatic fallback to default values when locale-specific content is unavailable.
+
+**Sources:** [connections.go:2025-2057](), [connections.go:2335-2365](), [connections.go:2249-2308]()
+
+## Performance Optimizations
+
+### Batching Strategy
+
+The system implements several batching optimizations to minimize database calls:
+
+| Optimization | Implementation | Benefit |
+|--------------|---------------|---------|
+| **Request Batching** | 70ms wait windows | Reduces database roundtrips |
+| **Deduplication** | Unique key mapping | Eliminates duplicate requests |
+| **Capacity Limits** | 5000 input capacity | Memory usage control |
+| **Right Skipping** | `userinfo.NewContextWithSkipRightKey()` | Bypasses permission checks for internal calls |
+
+### Concurrent Processing
+
+```mermaid
+graph TD
+    NOTIFICATION_LOADER["notificationReceiverLoader"] --> BUSINESS_MAP["Business Keys Mapping"]
+    BUSINESS_MAP --> WAIT_GROUP["sync.WaitGroup"]
+    WAIT_GROUP --> GOROUTINE_1["Business ID 1 Goroutine"]
+    WAIT_GROUP --> GOROUTINE_2["Business ID 2 Goroutine"]
+    WAIT_GROUP --> GOROUTINE_N["Business ID N Goroutine"]
+    
+    GOROUTINE_1 --> BATCH_REQUEST_1["BatchGetNotificationReceiverByTemplate"]
+    GOROUTINE_2 --> BATCH_REQUEST_2["BatchGetNotificationReceiverByTemplate"]
+    GOROUTINE_N --> BATCH_REQUEST_N["BatchGetNotificationReceiverByTemplate"]
+    
+    BATCH_REQUEST_1 --> RESULT_SYNC["Synchronized Result Collection"]
+    BATCH_REQUEST_2 --> RESULT_SYNC
+    BATCH_REQUEST_N --> RESULT_SYNC
+```
+
+Complex DataLoaders like `notificationReceiverLoader` use goroutines and wait groups to process requests for different business entities concurrently.
+
+**Sources:** [connections.go:380-424](), [connections.go:395-421]()
+
+## Union Types and Polymorphism
+
+The GraphQL schema leverages union types to handle polymorphic relationships across different entity types.
+
+### Resource Union Implementation
+
+```mermaid
+graph TD
+    BLOCK_HOUR["BlockHourRule.resource"] --> PREFIX_CHECK["idutil.GetPrefix(resourceId)"]
+    PREFIX_CHECK --> RESOURCE_PREFIX["resourcepb.Resource prefix"]
+    PREFIX_CHECK --> EMPLOYEE_PREFIX["linkStore.EmployeePrefix"]
+    
+    RESOURCE_PREFIX --> RESOURCE_LOADER["resourceLoader"]
+    EMPLOYEE_PREFIX --> EMPLOYEE_LOADER["employeeLoader"]
+    
+    RESOURCE_LOADER --> RESOURCE_UNION["ResourceUnion{Resource}"]
+    EMPLOYEE_LOADER --> EMPLOYEE_UNION["ResourceUnion{Employee}"]
+```
+
+The system uses prefix-based type discrimination to route requests to appropriate DataLoaders and construct proper union type responses.
+
+**Sources:** [connections.go:2403-2448](), [connections.go:2412-2426](), [connections.go:2428-2442]()
+
+## Metadata and Activity Tracking
+
+The GraphQL API provides comprehensive metadata enrichment for entities, including creator/updater information and activity tracking.
+
+### MetaInfo Pattern
+
+```mermaid
+graph LR
+    ENTITY["Entity (Resource/ResourceType/Employee)"] --> META_FUNC["metaInfo field"]
+    META_FUNC --> USER_LOADERS["userEmailLoader calls"]
+    USER_LOADERS --> CREATED_BY["CreatedBy DataLoader"]
+    USER_LOADERS --> UPDATED_BY["UpdatedBy DataLoader"]
+    
+    CREATED_BY --> META_RESPONSE["MetaInfo Response"]
+    UPDATED_BY --> META_RESPONSE
+    
+    META_RESPONSE --> CREATED_ON["CreatedOn timestamp"]
+    META_RESPONSE --> UPDATED_ON["UpdatedOn timestamp"]
+    META_RESPONSE --> CREATED_USER["CreatedBy user details"]
+    META_RESPONSE --> UPDATED_USER["UpdatedBy user details"]
+```
+
+This pattern is consistently applied across major entities like Resources, ResourceTypes, Employees, and BlockHourRules to provide audit trail information.
+
+**Sources:** [connections.go:1754-1790](), [connections.go:1839-1875](), [connections.go:2827-2875]()

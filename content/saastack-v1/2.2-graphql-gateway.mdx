@@ -1,0 +1,326 @@
+# GraphQL Gateway
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [connections.go](connections.go)
+- [graphql.go](graphql.go)
+
+</details>
+
+
+
+## Purpose and Scope
+
+The GraphQL Gateway serves as the unified API layer for the Waqt appointment scheduling platform, providing efficient data access and real-time capabilities across 40+ microservices. This document covers the GraphQL schema building, DataLoader batching architecture, Node interface implementation, and subscription management.
+
+For authentication and authorization mechanisms used by the GraphQL gateway, see [Authentication & Authorization](#2.3). For microservice integration patterns, see [Microservices Integration](#2.1).
+
+## Architecture Overview
+
+The GraphQL Gateway operates as a central orchestration layer that consolidates data access from multiple gRPC microservices through an efficient batching mechanism.
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        GQL_CLIENTS["GraphQL Clients"]
+        MOBILE["Mobile Apps"]
+        WEB["Web Applications"]
+    end
+    
+    subgraph "GraphQL Gateway Layer"
+        SCHEMA["schemabuilder.Schema"]
+        SUBSCRIPTIONS["GraphQL Subscriptions"]
+        CONNECTIONS["RegisterGraphQLConnections"]
+    end
+    
+    subgraph "DataLoader Layer"
+        CUSTOMER_DL["customerLoader"]
+        EMPLOYEE_DL["employeeLoader"] 
+        SERVICE_DL["serviceLoader"]
+        APPOINTMENT_DL["appointmentLoader"]
+        ORDER_DL["orderLoader"]
+        COMPANY_DL["companyLoader"]
+        LOCATION_DL["locationLoader"]
+        MORE_DL["30+ More DataLoaders"]
+    end
+    
+    subgraph "Microservices Layer"
+        CUSTOMER_SVC["customerpb.CustomersClient"]
+        EMPLOYEE_SVC["employeepb.EmployeesClient"]
+        SERVICE_SVC["servicepb.ServicesClient"]
+        APPOINTMENT_SVC["apppb.AppointmentsClient"]
+        ORDER_SVC["orderpb.OrdersClient"]
+        COMPANY_SVC["companypb.CompaniesClient"]
+        LOCATION_SVC["locationpb.LocationsClient"]
+        MORE_SVC["40+ More gRPC Services"]
+    end
+    
+    GQL_CLIENTS --> SCHEMA
+    MOBILE --> SCHEMA
+    WEB --> SCHEMA
+    
+    SCHEMA --> SUBSCRIPTIONS
+    SCHEMA --> CONNECTIONS
+    
+    CONNECTIONS --> CUSTOMER_DL
+    CONNECTIONS --> EMPLOYEE_DL
+    CONNECTIONS --> SERVICE_DL
+    CONNECTIONS --> APPOINTMENT_DL
+    CONNECTIONS --> ORDER_DL
+    CONNECTIONS --> COMPANY_DL
+    CONNECTIONS --> LOCATION_DL
+    CONNECTIONS --> MORE_DL
+    
+    CUSTOMER_DL --> CUSTOMER_SVC
+    EMPLOYEE_DL --> EMPLOYEE_SVC
+    SERVICE_DL --> SERVICE_SVC
+    APPOINTMENT_DL --> APPOINTMENT_SVC
+    ORDER_DL --> ORDER_SVC
+    COMPANY_DL --> COMPANY_SVC
+    LOCATION_DL --> LOCATION_SVC
+    MORE_DL --> MORE_SVC
+```
+
+Sources: [connections.go:88-154](), [graphql.go:9-28]()
+
+## Schema Registration Process
+
+The GraphQL schema registration follows a dependency injection pattern where individual services register their schema components during application startup.
+
+```mermaid
+graph LR
+    subgraph "Application Bootstrap"
+        FX_APP["fx.New Application"]
+        CONFIG["ExposureConfig"]
+    end
+    
+    subgraph "Schema Registration"
+        REG_IN["RegisterGraphqlSchemasIn"]
+        SCHEMA["schemabuilder.Schema"]
+        SERVICES["GraphQLRegister[]"]
+    end
+    
+    subgraph "Registration Components"
+        CONNECTIONS_REG["RegisterGraphQLConnections"]
+        NODE_REG["RegisterNodeInterface"]
+        SUBSCRIPTIONS_REG["RegisterGraphqlSubscriptions"]
+        TIMEOUT_TEST["RegisterGqlTimeoutTest"]
+    end
+    
+    FX_APP --> REG_IN
+    CONFIG --> REG_IN
+    REG_IN --> SCHEMA
+    REG_IN --> SERVICES
+    
+    SERVICES --> CONNECTIONS_REG
+    SERVICES --> NODE_REG
+    SERVICES --> SUBSCRIPTIONS_REG
+    SERVICES --> TIMEOUT_TEST
+```
+
+The registration process is controlled by the `ExposureConfig.Graphql` flag and processes all services tagged with the `graphql-service` group annotation.
+
+Sources: [graphql.go:9-28]()
+
+## DataLoader Architecture
+
+The GraphQL Gateway implements an extensive DataLoader architecture for efficient batching of requests to underlying microservices. Each DataLoader is configured with specific batching parameters to optimize performance.
+
+### DataLoader Configuration
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `WithCache` | `&dataloader.NoCache{}` | Disables caching for real-time data |
+| `WithWait` | `70*time.Millisecond` | Batching window duration |
+| `WithInputCapacity` | `5000` | Maximum batch size |
+| `WithBatchCapacity` | `1000` | Alternative batch capacity for specific loaders |
+
+### Core DataLoaders
+
+```mermaid
+graph TB
+    subgraph "Entity DataLoaders"
+        CUSTOMER_DL["customerLoader<br/>BatchGetCustomer"]
+        EMPLOYEE_DL["employeeLoader<br/>BatchGetEmployee"]
+        SERVICE_DL["serviceLoader<br/>BatchGetService"]
+        APPOINTMENT_DL["appointmentLoader<br/>BatchGetAppointment"]
+        COMPANY_DL["companyLoader<br/>BatchGetCompany"]
+        LOCATION_DL["locationLoader<br/>BatchGetLocation"]
+        ORDER_DL["orderLoader<br/>BatchGetOrder"]
+    end
+    
+    subgraph "Relationship DataLoaders"
+        LINK_DL["batchLinkLoader<br/>BulkGetAllLinksOfResource"]
+        ORDER_ITEMS_DL["ordersByItemIdLoader<br/>BatchGetOrdersByItemId"]
+        NOTES_DL["notesLoader<br/>BatchGetNoteByTypes"]
+    end
+    
+    subgraph "Settings DataLoaders"
+        SVC_SETTINGS_DL["serviceSettingsLoader<br/>BatchGetServiceSetting"]
+        EMP_SETTINGS_DL["employeeSettingsLoader<br/>BatchGetEmployeeSetting"]
+        TMP_SETTINGS_DL["templateSettingsLoader<br/>BatchGetTemplateSetting"]
+    end
+    
+    subgraph "Business Logic DataLoaders"
+        INVOICE_DL["invoiceLoader<br/>BatchGetInvoiceByOrder"]
+        RECEIPT_DL["receiptLoader<br/>BatchGetReceiptByReference"]
+        FORM_SUB_DL["ifSubmissionByAgainstLoader<br/>BatchGetIntakeFormSubmissionsUsingAgainst"]
+    end
+```
+
+Each DataLoader follows a consistent pattern where it accumulates requests during the wait period, then executes a single batch request to the corresponding gRPC service.
+
+Sources: [connections.go:156-172](), [connections.go:442-478](), [connections.go:426-440](), [connections.go:920-934]()
+
+### Rights Management in DataLoaders
+
+Several DataLoaders implement rights bypassing for specific use cases:
+
+```go
+// Example from customerLoader
+res, err := customer.BatchGetCustomer(userinfo.NewContextWithSkipRightKey(ctx), &customerpb.BatchGetCustomerRequest{
+    Ids:           keys.Keys(),
+    ViewMask:      &field_mask.FieldMask{Paths: []string{}},
+    AccessContact: true,
+})
+```
+
+This pattern ensures that users who have permission to see an entity can access its related data without additional permission checks.
+
+Sources: [connections.go:159-162](), [connections.go:922-925](), [connections.go:453-456]()
+
+## GraphQL Object Registration
+
+The GraphQL Gateway registers object types and their field resolvers through the `RegisterGraphQLConnections` function. This process creates DataLoader-backed field functions for efficient relationship traversal.
+
+### Object Field Registration
+
+```mermaid
+graph TB
+    subgraph "Schema Builder Registration"
+        GET_OBJECT["sb.GetObject(typeName, protoType)"]
+        FIELD_FUNC["payload.FieldFunc(fieldName, resolver)"]
+        DATALOADER_RESOLVE["DataLoader thunk resolution"]
+    end
+    
+    subgraph "Example: Appointment Object"
+        APT_OBJECT["sb.GetObject('Appointment', apppb.Appointment{})"]
+        NOTE_FIELD["payload.FieldFunc('note', noteResolver)"]
+        EMAIL_FIELD["payload.FieldFunc('emailOfBookedBy', emailResolver)"]
+    end
+    
+    subgraph "DataLoader Integration"
+        NOTES_LOADER["notesLoader.Load(ctx, appointmentId)"]
+        USER_EMAIL_LOADER["userEmailLoader.Load(ctx, userId)"]
+        THUNK_RETURN["thunk() returns resolved data"]
+    end
+    
+    GET_OBJECT --> FIELD_FUNC
+    FIELD_FUNC --> DATALOADER_RESOLVE
+    
+    APT_OBJECT --> NOTE_FIELD
+    APT_OBJECT --> EMAIL_FIELD
+    
+    NOTE_FIELD --> NOTES_LOADER
+    EMAIL_FIELD --> USER_EMAIL_LOADER
+    NOTES_LOADER --> THUNK_RETURN
+    USER_EMAIL_LOADER --> THUNK_RETURN
+```
+
+Each GraphQL object type gets field functions that use DataLoaders to efficiently fetch related data. The registration follows a pattern where the field function returns a thunk that resolves the DataLoader result.
+
+Sources: [connections.go:1186-1232](), [connections.go:1233-1247]()
+
+## Real-time Subscriptions
+
+The GraphQL Gateway provides real-time capabilities through WebSocket subscriptions for critical business events.
+
+### Subscription Types
+
+```mermaid
+graph TB
+    subgraph "GraphQL Subscriptions"
+        APPOINTMENTS["appointments"]
+        NOTIFICATIONS["notifications"]
+        BLOCK_HOURS["blockHours"]
+        TEST_SUB["shivam (test)"]
+    end
+    
+    subgraph "Subscription Handlers"
+        APT_HANDLER["appointment.SubscriptionHandler"]
+        NOTIF_HANDLER["notification.SubscriptionHandler"]
+        BLOCK_HANDLER["blockHour.SubscriptionHandler"]
+    end
+    
+    subgraph "Filter Parameters"
+        APT_FILTERS["Parents, EmployeeIds<br/>ServiceIds, ResourceIds<br/>StartTime, EndTime"]
+        NOTIF_FILTERS["UserId, Locale<br/>EventType, StatusType"]
+        BLOCK_FILTERS["Parents, EmployeeIds<br/>ResourceIds, Sources<br/>StartTime, EndTime"]
+    end
+    
+    APPOINTMENTS --> APT_HANDLER
+    NOTIFICATIONS --> NOTIF_HANDLER
+    BLOCK_HOURS --> BLOCK_HANDLER
+    
+    APT_HANDLER --> APT_FILTERS
+    NOTIF_HANDLER --> NOTIF_FILTERS
+    BLOCK_HANDLER --> BLOCK_FILTERS
+```
+
+### Subscription Processing Flow
+
+Each subscription follows a common pattern:
+
+1. **Payload Unmarshaling**: Convert the subscription payload into the appropriate protobuf message
+2. **Filtering**: Apply subscription-specific filters to determine if the update is relevant
+3. **Service Handler**: Delegate to the microservice's subscription handler for business logic processing
+
+```go
+// Example filtering logic for appointments
+if len(args.Parents) > 0 && !contains(args.Parents, idutil.GetParent(app.GetId())) {
+    return nil, graphql.ErrNoUpdate
+}
+```
+
+Sources: [subscriptions.go:46-89](), [subscriptions.go:91-118](), [subscriptions.go:120-166]()
+
+## Error Handling and Performance
+
+### DataLoader Error Handling
+
+DataLoaders implement consistent error handling where errors are propagated to all batched requests:
+
+```go
+for i := range keys {
+    r := dataloader.Result{Error: err}
+    if err == nil {
+        r.Data = res.Customer[i]
+    }
+    results = append(results, &r)
+}
+```
+
+### Performance Optimizations
+
+| Optimization | Implementation | Purpose |
+|--------------|----------------|---------|
+| **Deduplication** | Unique key mapping in employeeLoader | Prevents duplicate requests |
+| **Concurrent Processing** | Goroutines in notificationReceiverLoader | Parallel processing per business ID |
+| **Field Masking** | `&field_mask.FieldMask{Paths: []string{}}` | Reduces payload size |
+| **Capacity Management** | `WithInputCapacity(5000)` | Controls memory usage |
+
+Sources: [connections.go:445-451](), [connections.go:395-424](), [connections.go:159-162]()
+
+## Integration Points
+
+The GraphQL Gateway integrates with several other system components:
+
+- **Authentication Middleware**: All requests pass through authentication layers before reaching DataLoaders
+- **Rights Management**: Service-specific rights validation through `userinfo.NewContextWithSkipRightKey()`
+- **Metrics & Logging**: Request tracing and performance monitoring through structured logging
+- **Policy Validation**: Source validation for policy enforcement through the policy-sources module
+
+Sources: [policy-sources/validator.go:26-78](), [connections.go:159](), [connections.go:922]()

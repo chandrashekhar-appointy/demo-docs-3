@@ -1,0 +1,334 @@
+# Core Components
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [main.go](main.go)
+- [modules.go](modules.go)
+
+</details>
+
+
+
+This document covers the essential application components that form the foundation of the waqt-deployment service. These core components handle application bootstrapping, dependency injection, service module registration, and the fundamental infrastructure required to run the multi-protocol API gateway.
+
+For information about the specific API implementations, see [API Layer](#4). For details about the authentication and authorization mechanisms, see [Security & Access Control](#5).
+
+## Application Bootstrap Framework
+
+The waqt-deployment service uses Uber's FX dependency injection framework to manage component lifecycle and dependencies. The application bootstrap process is centralized in the `main` function, which constructs and configures the entire dependency graph.
+
+```mermaid
+graph TD
+    subgraph "Application Bootstrap"
+        MAIN["main()"]
+        RUN["run()"]
+        APP["fx.New()"]
+    end
+    
+    subgraph "Core Infrastructure Modules"
+        GRPC["grpc.Module"]
+        HTTP["http.Module"]
+        GRAPHQL["graphql.Module"]
+        AUTH["auth.Module"]
+        SQL["sql.Module"]
+        REDIS["redis.Module"]
+        LOG["log.Module"]
+        TELEMETRY["telemetry.Module"]
+    end
+    
+    subgraph "Custom Modules"
+        ROLES["roles.Module"]
+        LINKS["links.Module"]
+        LICENSE["license.Module"]
+        SLUGS["slugs.Module"]
+        ENV_CONFIG["envConfig.Module"]
+    end
+    
+    subgraph "Service Modules"
+        SERVICE_MODULES["ServiceModules"]
+        WAQT_SERVICES["waqt domain services"]
+        SAASTACK_SERVICES["saastack.io platform services"]
+    end
+    
+    MAIN --> RUN
+    RUN --> APP
+    APP --> GRPC
+    APP --> HTTP
+    APP --> GRAPHQL
+    APP --> AUTH
+    APP --> SQL
+    APP --> REDIS
+    APP --> LOG
+    APP --> TELEMETRY
+    APP --> ROLES
+    APP --> LINKS
+    APP --> LICENSE
+    APP --> SLUGS
+    APP --> ENV_CONFIG
+    APP --> SERVICE_MODULES
+    SERVICE_MODULES --> WAQT_SERVICES
+    SERVICE_MODULES --> SAASTACK_SERVICES
+```
+
+The FX application is constructed with multiple module groups, each providing specific functionality. The `fx.New()` call in `run()` assembles all modules into a cohesive application container.
+
+**Sources:** [main.go:54-131]()
+
+## Infrastructure Module Configuration
+
+The core infrastructure modules provide essential services that all other components depend on. These modules are loaded early in the bootstrap process to ensure availability throughout the application lifecycle.
+
+| Module | Purpose | Key Components |
+|--------|---------|----------------|
+| `grpc.Module` | gRPC server and interceptors | Server, interceptor chain, service registration |
+| `http.Module` | HTTP server and routing | Chi router, middleware chain, endpoints |
+| `graphql.Module` | GraphQL server and schema | Schema federation, resolvers, subscriptions |
+| `auth.Module` | Authentication infrastructure | JWT validation, service tokens, API keys |
+| `sql.Module` | Database connectivity | PostgreSQL connections, migrations |
+| `redis.Module` | Cache layer | Redis client, distributed caching |
+| `log.Module` | Structured logging | Zap logger configuration |
+| `telemetry.Module` | Observability | Metrics, tracing, monitoring |
+
+```mermaid
+graph LR
+    subgraph "Infrastructure Layer"
+        subgraph "Network Protocols"
+            GRPC_MOD["grpc.Module"]
+            HTTP_MOD["http.Module"]
+            GRAPHQL_MOD["graphql.Module"]
+        end
+        
+        subgraph "Data Layer"
+            SQL_MOD["sql.Module"]
+            REDIS_MOD["redis.Module"]
+            CACHE_MOD["cache.Module"]
+        end
+        
+        subgraph "Cross-cutting Concerns"
+            AUTH_MOD["auth.Module"]
+            LOG_MOD["log.Module"]
+            TELEMETRY_MOD["telemetry.Module"]
+            THROTTLE_MOD["throttle.Module"]
+        end
+    end
+    
+    subgraph "Application Services"
+        SERVICE_LAYER["Service Modules"]
+    end
+    
+    GRPC_MOD --> SERVICE_LAYER
+    HTTP_MOD --> SERVICE_LAYER
+    GRAPHQL_MOD --> SERVICE_LAYER
+    SQL_MOD --> SERVICE_LAYER
+    REDIS_MOD --> SERVICE_LAYER
+    CACHE_MOD --> SERVICE_LAYER
+    AUTH_MOD --> SERVICE_LAYER
+    LOG_MOD --> SERVICE_LAYER
+    TELEMETRY_MOD --> SERVICE_LAYER
+    THROTTLE_MOD --> SERVICE_LAYER
+```
+
+**Sources:** [main.go:61-88]()
+
+## Service Module Registry
+
+The `ServiceModules` variable in `modules.go` defines a comprehensive registry of all business logic modules integrated into the deployment service. This registry uses FX's `fx.Options` to bundle multiple service modules for injection.
+
+```mermaid
+graph TB
+    subgraph "ServiceModules Registry"
+        SERVICE_MODULES["ServiceModules (fx.Options)"]
+    end
+    
+    subgraph "waqt Domain Services"
+        APPOINTMENT["appointment.Module"]
+        SERVICE["service.Module"]
+        RESOURCE["resource.Module"]
+        BLOCK_HOUR["blockHour.Module"]
+        OPEN_HOUR["openHour.Module"]
+        CALENDAR["calendarEntities.CalendarInfoModule"]
+        INTAKE_FORM["intakeForm.Module"]
+        SERVICE_PRICE["servicePrice.Module"]
+    end
+    
+    subgraph "saastack.io Platform Services"
+        USER["userProfile.Module"]
+        COMPANY["company.Module"]
+        CUSTOMER["customer.Module"]
+        EMPLOYEE["employee.Module"]
+        BILLING["billing.Module"]
+        ANALYTICS["analytics.Module"]
+        INTEGRATION["integration.Module"]
+        LICENSE_MOD["license.Module"]
+    end
+    
+    subgraph "Supporting Services"
+        DISCOUNT["discount.Module"]
+        MEMBERSHIP["membership.Module"]
+        GIFT_CERT["giftCertificate.Module"]
+        DYNAMIC_LINK["dynamicLinkPb.Module"]
+        SLUG["slug.Module"]
+        POLICY["policy.Module"]
+    end
+    
+    SERVICE_MODULES --> APPOINTMENT
+    SERVICE_MODULES --> SERVICE
+    SERVICE_MODULES --> RESOURCE
+    SERVICE_MODULES --> BLOCK_HOUR
+    SERVICE_MODULES --> OPEN_HOUR
+    SERVICE_MODULES --> CALENDAR
+    SERVICE_MODULES --> INTAKE_FORM
+    SERVICE_MODULES --> SERVICE_PRICE
+    
+    SERVICE_MODULES --> USER
+    SERVICE_MODULES --> COMPANY
+    SERVICE_MODULES --> CUSTOMER
+    SERVICE_MODULES --> EMPLOYEE
+    SERVICE_MODULES --> BILLING
+    SERVICE_MODULES --> ANALYTICS
+    SERVICE_MODULES --> INTEGRATION
+    SERVICE_MODULES --> LICENSE_MOD
+    
+    SERVICE_MODULES --> DISCOUNT
+    SERVICE_MODULES --> MEMBERSHIP
+    SERVICE_MODULES --> GIFT_CERT
+    SERVICE_MODULES --> DYNAMIC_LINK
+    SERVICE_MODULES --> SLUG
+    SERVICE_MODULES --> POLICY
+```
+
+The registry contains over 100 service modules organized into three main categories:
+
+- **waqt Domain Services**: Core appointment booking functionality
+- **saastack.io Platform Services**: Cross-platform user management and billing
+- **Supporting Services**: Additional features like discounts and memberships
+
+**Sources:** [modules.go:155-312]()
+
+## Custom Deployment Modules
+
+The deployment service includes several custom modules that provide deployment-specific functionality not available in the core platform services.
+
+| Module | Path | Purpose |
+|--------|------|---------|
+| `roles.Module` | `deployment/roles` | Role definition and management |
+| `links.Module` | `deployment/links` | Link validation and management |
+| `license.Module` | `deployment/license` | License validation and consumption |
+| `slugs.Module` | `deployment/slugs` | URL slug generation and validation |
+| `envConfig.Module` | `deployment/env` | Environment-specific configuration |
+
+```mermaid
+graph LR
+    subgraph "Custom Deployment Modules"
+        ROLES_DEP["roles.Module"]
+        LINKS_DEP["links.Module"]
+        LICENSE_DEP["license.Module"]
+        SLUGS_DEP["slugs.Module"]
+        ENV_DEP["envConfig.Module"]
+        ADDON_DEP["addon.Module"]
+        MEMBERSHIP_ITEMS["membership_items.Module"]
+        DISCOUNT_ITEMS["discount_items.Module"]
+    end
+    
+    subgraph "Module Functions"
+        ROLE_MGMT["Role Management"]
+        LINK_VALIDATION["Link Validation"]
+        LICENSE_CHECK["License Validation"]
+        SLUG_GEN["Slug Generation"]
+        CONFIG_MGMT["Configuration Management"]
+        ADDON_PROC["Addon Processing"]
+        MEM_WALLET["Membership Wallet"]
+        DISC_CALC["Discount Calculation"]
+    end
+    
+    ROLES_DEP --> ROLE_MGMT
+    LINKS_DEP --> LINK_VALIDATION
+    LICENSE_DEP --> LICENSE_CHECK
+    SLUGS_DEP --> SLUG_GEN
+    ENV_DEP --> CONFIG_MGMT
+    ADDON_DEP --> ADDON_PROC
+    MEMBERSHIP_ITEMS --> MEM_WALLET
+    DISCOUNT_ITEMS --> DISC_CALC
+```
+
+**Sources:** [main.go:79-104]()
+
+## Application Lifecycle Management
+
+The FX framework manages the complete application lifecycle through a series of invocation functions that initialize and start various services in the correct order.
+
+```mermaid
+sequenceDiagram
+    participant MAIN as "main()"
+    participant FX as "fx.New()"
+    participant MIGRATOR as "InvokeMigrator"
+    participant GRPC as "grpc.RunServer"
+    participant HTTP as "http.RunServer"
+    participant GQL as "RegisterGraphQLConnections"
+    
+    MAIN->>FX: Create application container
+    FX->>MIGRATOR: Run database migrations
+    MIGRATOR->>GQL: Register GraphQL services
+    GQL->>GRPC: Start gRPC server
+    GRPC->>HTTP: Start HTTP server
+    HTTP->>MAIN: Application ready
+    
+    Note over MAIN,HTTP: Application runs until shutdown signal
+```
+
+The lifecycle includes several key invocation points:
+
+- `InvokeMigrator`: Runs database migrations
+- `RegisterApiEndpoints`: Registers HTTP API routes
+- `InvokeGraphQLServices`: Initializes GraphQL schema
+- `InvokeGrpcServices`: Registers gRPC services
+- `RegisterGraphQLConnections`: Connects GraphQL to underlying services
+- Server startup: `grpc.RunServer` and `http.RunServer`
+
+**Sources:** [main.go:105-121]()
+
+## Component Integration Patterns
+
+The deployment service uses several integration patterns to connect components and manage dependencies effectively.
+
+### Provider Functions
+
+FX provider functions create and configure service instances:
+
+```mermaid
+graph TD
+    subgraph "Provider Functions"
+        VERSION_PROVIDER["version.String Provider"]
+        USER_INFO_PROVIDER["driver.IUserInfo Provider"]
+        EXPOSURE_CONFIG["NewExposureConfig"]
+        METRIC_TRACKER["metrictracker.NewMetricTracker"]
+    end
+    
+    subgraph "Consumed Services"
+        VERSION_SERVICE["Version Service"]
+        USER_CONTEXT["User Context Service"] 
+        FEATURE_FLAGS["Feature Flag Configuration"]
+        METRICS["Metrics Collection"]
+    end
+    
+    VERSION_PROVIDER --> VERSION_SERVICE
+    USER_INFO_PROVIDER --> USER_CONTEXT
+    EXPOSURE_CONFIG --> FEATURE_FLAGS
+    METRIC_TRACKER --> METRICS
+```
+
+### Error Handling
+
+The application uses FX's error handling mechanism to ensure proper error reporting:
+
+```mermaid
+graph LR
+    APP_ERROR["Application Error"] --> ERROR_HOOK["fx.ErrorHook"]
+    ERROR_HOOK --> LOG_HANDLER["log.ErrorHandler"]
+    LOG_HANDLER --> STRUCTURED_LOG["Structured Error Log"]
+```
+
+**Sources:** [main.go:83-97]()
